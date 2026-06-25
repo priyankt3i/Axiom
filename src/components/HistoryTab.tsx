@@ -2,7 +2,7 @@ import React from 'react';
 import { List, Search, RotateCcw, Cpu } from 'lucide-react';
 import { JobHistory } from '../types';
 
-export function HistoryTab({ jobHistoryData }: { jobHistoryData: JobHistory[] }) {
+export function HistoryTab({ jobHistoryData, onRefresh }: { jobHistoryData: JobHistory[]; onRefresh: () => void }) {
   return (
     <div className="flex-1 flex flex-col overflow-y-auto p-6 bg-slate-50">
       <div className="max-w-6xl mx-auto w-full">
@@ -21,7 +21,10 @@ export function HistoryTab({ jobHistoryData }: { jobHistoryData: JobHistory[] })
             <button className="px-3 py-1.5 border border-[#E2E8F0] bg-white text-xs font-bold text-slate-700 hover:bg-slate-100 flex items-center gap-1">
               <Search className="w-3.5 h-3.5" /> Filter
             </button>
-            <button className="px-3 py-1.5 bg-[#0F172A] text-white text-xs font-bold hover:bg-slate-800 flex items-center gap-1">
+            <button
+              onClick={onRefresh}
+              className="px-3 py-1.5 bg-[#0F172A] text-white text-xs font-bold hover:bg-slate-800 flex items-center gap-1"
+            >
               <RotateCcw className="w-3.5 h-3.5" /> Refresh
             </button>
           </div>

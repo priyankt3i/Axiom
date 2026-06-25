@@ -1,9 +1,33 @@
 import React, { useState } from 'react';
 import { DollarSign, Search } from 'lucide-react';
-import { LedgerEntry } from '../types';
+import { LedgerEntry, LedgerSummary } from '../types';
 
-export function LedgerTab({ ledgerData }: { ledgerData: LedgerEntry[] }) {
+export function LedgerTab({
+  ledgerData,
+  summary,
+  canView
+}: {
+  ledgerData: LedgerEntry[];
+  summary: LedgerSummary;
+  canView: boolean;
+}) {
   const [searchLedger, setSearchLedger] = useState("");
+
+  if (!canView) {
+    return (
+      <div className="flex-1 flex items-center justify-center p-6">
+        <div className="border border-[#E2E8F0] bg-[#F8FAFC] p-6 max-w-md">
+          <h1 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+            <DollarSign className="w-5 h-5" />
+            Ledger Restricted
+          </h1>
+          <p className="text-sm text-slate-500 mt-2">
+            Financial ledger access is available to Manager and Administrator roles.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex-1 flex flex-col overflow-y-auto p-6">
@@ -21,7 +45,7 @@ export function LedgerTab({ ledgerData }: { ledgerData: LedgerEntry[] }) {
         </div>
         <div className="text-right">
           <span className="text-[10px] uppercase text-[#475569] font-bold">TOTAL YEAR-TO-DATE COST</span>
-          <div className="text-2xl font-mono font-bold">$4,218.42</div>
+          <div className="text-2xl font-mono font-bold">${summary.totalActualCost.toFixed(5)}</div>
         </div>
       </div>
 
@@ -30,25 +54,25 @@ export function LedgerTab({ ledgerData }: { ledgerData: LedgerEntry[] }) {
         <div className="border border-[#E2E8F0] p-4 bg-[#F8FAFC]">
           <span className="text-[10px] font-bold text-[#475569] uppercase">API Status</span>
           <div className="text-lg font-mono font-bold text-emerald-700 mt-1">ACTIVE</div>
-          <span className="text-[10px] text-slate-400 font-mono block mt-1">Secure Connection</span>
+          <span className="text-[10px] text-slate-400 font-mono block mt-1">Backend Ledger</span>
         </div>
 
         <div className="border border-[#E2E8F0] p-4 bg-[#F8FAFC]">
-          <span className="text-[10px] font-bold text-[#475569] uppercase">Avg Task Time</span>
-          <div className="text-lg font-mono font-bold text-slate-900 mt-1">14.8 seconds</div>
-          <span className="text-[10px] text-slate-400 font-mono block mt-1">Across 142 tasks</span>
+          <span className="text-[10px] font-bold text-[#475569] uppercase">Total Tasks</span>
+          <div className="text-lg font-mono font-bold text-slate-900 mt-1">{summary.totalJobs}</div>
+          <span className="text-[10px] text-slate-400 font-mono block mt-1">Persisted records</span>
         </div>
 
         <div className="border border-[#E2E8F0] p-4 bg-[#F8FAFC]">
           <span className="text-[10px] font-bold text-[#475569] uppercase">Success Rate</span>
-          <div className="text-lg font-mono font-bold text-blue-600 mt-1">94.2% Passed</div>
-          <span className="text-[10px] text-slate-400 font-mono block mt-1">Tests passed within 2 attempts</span>
+          <div className="text-lg font-mono font-bold text-blue-600 mt-1">{summary.successRate.toFixed(1)}% Passed</div>
+          <span className="text-[10px] text-slate-400 font-mono block mt-1">Terminal jobs only</span>
         </div>
 
         <div className="border border-[#E2E8F0] p-4 bg-[#F8FAFC]">
-          <span className="text-[10px] font-bold text-[#475569] uppercase">Budget Limit</span>
-          <div className="text-lg font-mono font-bold text-slate-900 mt-1">$10,000.00 USD</div>
-          <span className="text-[10px] text-slate-400 font-mono block mt-1">Weekly cost limit</span>
+          <span className="text-[10px] font-bold text-[#475569] uppercase">Completed</span>
+          <div className="text-lg font-mono font-bold text-slate-900 mt-1">{summary.completedJobs}</div>
+          <span className="text-[10px] text-slate-400 font-mono block mt-1">Approved merges</span>
         </div>
       </div>
 
@@ -100,9 +124,11 @@ export function LedgerTab({ ledgerData }: { ledgerData: LedgerEntry[] }) {
                     <span className={`px-1.5 py-0.5 text-[10px] font-bold ${
                       item.status === "COMPLETED" 
                         ? "bg-emerald-100 text-emerald-800" 
-                        : "bg-red-100 text-red-800"
+                        : item.status === "REVIEW_READY" || item.status === "IN_PROGRESS"
+                          ? "bg-blue-100 text-blue-800"
+                          : "bg-red-100 text-red-800"
                     }`}>
-                      {item.status}
+                      {item.status.replace("_", " ")}
                     </span>
                   </td>
                 </tr>

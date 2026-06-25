@@ -3,6 +3,7 @@ import { Monitor, X, Play, Terminal } from 'lucide-react';
 
 interface PipelineTabProps {
   taskInput: string;
+  branchName?: string;
   pipelineState: any;
   setPipelineState: any;
   handleRollback: () => void;
@@ -10,11 +11,13 @@ interface PipelineTabProps {
   handleDispatchJob: () => void;
   isDispatching: boolean;
   logsEndRef: any;
-  setActiveTab: (tab: string) => void;
+  setActiveTab: (tab: "dispatcher" | "pipeline" | "audit" | "ledger" | "schemas" | "settings" | "history") => void;
+  canReview: boolean;
 }
 
 export function PipelineTab({
   taskInput,
+  branchName,
   pipelineState,
   setPipelineState,
   handleRollback,
@@ -22,7 +25,8 @@ export function PipelineTab({
   handleDispatchJob,
   isDispatching,
   logsEndRef,
-  setActiveTab
+  setActiveTab,
+  canReview
 }: PipelineTabProps) {
   const [isDropInOpen, setIsDropInOpen] = useState(false);
 
@@ -108,7 +112,7 @@ export function PipelineTab({
               Task: {taskInput}
             </h1>
             <span className="text-xs bg-[#E2E8F0] px-1.5 py-0.5 font-mono">
-              feature/task-branch
+              {branchName || "no-branch-yet"}
             </span>
           </div>
           <div className="flex items-center gap-2 mt-1">
@@ -120,7 +124,7 @@ export function PipelineTab({
         </div>
 
         <div className="flex gap-2 font-mono">
-          {pipelineState.terminalStatus === "PR_DRAFT" && (
+          {pipelineState.terminalStatus === "PR_DRAFT" && canReview && (
             <>
               <button
                 onClick={handleRollback}
@@ -135,6 +139,11 @@ export function PipelineTab({
                 APPROVE & MERGE
               </button>
             </>
+          )}
+          {pipelineState.terminalStatus === "PR_DRAFT" && !canReview && (
+            <span className="px-3 py-1.5 border border-[#E2E8F0] text-slate-500 text-xs font-bold">
+              MANAGER REVIEW REQUIRED
+            </span>
           )}
           {pipelineState.terminalStatus === "IDLE" && (
             <button

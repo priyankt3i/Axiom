@@ -1,11 +1,13 @@
 import React from 'react';
 import { Server } from 'lucide-react';
+import { SettingsPayload } from '../types';
 
 interface RightSidebarProps {
   pipelineState: any; // Using any for now to simplify typing
+  settings: SettingsPayload | null;
 }
 
-export function RightSidebar({ pipelineState }: RightSidebarProps) {
+export function RightSidebar({ pipelineState, settings }: RightSidebarProps) {
   return (
     <aside className="w-64 border-l border-[#E2E8F0] flex flex-col bg-[#F8FAFC] p-4 gap-4 overflow-y-auto">
       
@@ -72,22 +74,24 @@ export function RightSidebar({ pipelineState }: RightSidebarProps) {
           <div className="flex justify-between items-center">
             <span className="text-slate-400">Workflow Server:</span>
             <span className="text-emerald-700 font-bold flex items-center gap-1">
-              <Server className="w-3 h-3" /> ONLINE
+              <Server className="w-3 h-3" /> {settings?.runtime.workflowProvider === "temporal" ? "TEMPORAL" : "LOCAL"}
             </span>
           </div>
           <div className="flex justify-between items-center">
             <span className="text-slate-400">Test Environment:</span>
             <span className="text-emerald-700 font-bold flex items-center gap-1">
-              <Server className="w-3 h-3" /> READY
+              <Server className="w-3 h-3" /> {settings?.runtime.sandboxProvider === "kubernetes" ? "K8S" : "LOCAL"}
             </span>
           </div>
           <div className="flex justify-between items-center">
-            <span className="text-slate-400">Network Security:</span>
-            <span className="text-amber-700 font-bold">SECURE</span>
+            <span className="text-slate-400">Data Store:</span>
+            <span className="text-slate-800 font-bold uppercase">{settings?.runtime.dataStore || "loading"}</span>
           </div>
           <div className="flex justify-between items-center">
-            <span className="text-slate-400">Data Encryption:</span>
-            <span className="text-slate-800">AES-256</span>
+            <span className="text-slate-400">OAuth:</span>
+            <span className={settings?.integrations.githubOAuthConfigured ? "text-emerald-700 font-bold" : "text-amber-700 font-bold"}>
+              {settings?.integrations.githubOAuthConfigured ? "GITHUB" : "DEV LOGIN"}
+            </span>
           </div>
         </div>
       </div>

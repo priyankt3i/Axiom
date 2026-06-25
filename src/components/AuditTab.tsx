@@ -5,9 +5,10 @@ interface AuditTabProps {
   jobData: PipelineJob;
   onRollback: () => void;
   onApproveMerge: () => void;
+  canReview: boolean;
 }
 
-export function AuditTab({ jobData, onRollback, onApproveMerge }: AuditTabProps) {
+export function AuditTab({ jobData, onRollback, onApproveMerge, canReview }: AuditTabProps) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       
@@ -27,20 +28,26 @@ export function AuditTab({ jobData, onRollback, onApproveMerge }: AuditTabProps)
           </p>
         </div>
         
-        <div className="flex gap-2">
-          <button
-            onClick={onRollback}
-            className="px-3 py-1.5 border border-red-600 text-red-600 text-xs font-bold font-mono hover:bg-red-50"
-          >
-            UNDO CHANGES
-          </button>
-          <button
-            onClick={onApproveMerge}
-            className="px-3 py-1.5 bg-[#0F172A] text-white text-xs font-bold font-mono hover:bg-slate-800"
-          >
-            APPROVE & MERGE
-          </button>
-        </div>
+        {canReview ? (
+          <div className="flex gap-2">
+            <button
+              onClick={onRollback}
+              className="px-3 py-1.5 border border-red-600 text-red-600 text-xs font-bold font-mono hover:bg-red-50"
+            >
+              UNDO CHANGES
+            </button>
+            <button
+              onClick={onApproveMerge}
+              className="px-3 py-1.5 bg-[#0F172A] text-white text-xs font-bold font-mono hover:bg-slate-800"
+            >
+              APPROVE & MERGE
+            </button>
+          </div>
+        ) : (
+          <div className="text-xs font-mono text-slate-500 border border-[#E2E8F0] px-3 py-1.5">
+            Manager approval required
+          </div>
+        )}
       </div>
 
       {/* Split Diff Panel */}

@@ -2,29 +2,91 @@
 
 Enterprise-grade multi-agent software engineering task scheduler, pipeline orchestrator, sandbox verification environment, and audit log ledger.
 
+The app now has a real Express backend boundary for authentication, RBAC, encrypted integration credentials, persisted task records, durable queue state, audit state, and ledger state. The long-running agent execution still uses the local durable queue worker until Temporal, Kubernetes, Hermes, and GitHub App adapters are connected.
+
 ## Project Structure
 
-- `src/App.tsx`: Main React application containing the UI/UX implementation of the Dispatcher, Pipeline, Audit Trail, and Ledger.
-- `src/operational-code/schema.sql`: Full PostgreSQL database schema defining Users, Roles, Jobs, JobExecutions, FinancialLedger, and QALogs.
+- `src/App.tsx`: React shell that authenticates users, calls backend APIs, polls active jobs, and renders the Dispatcher, Pipeline, Audit Trail, Ledger, History, Settings, and Schema views.
+- `src/operational-code/schema.sql`: Full PostgreSQL domain schema defining Users, Roles, Jobs, JobExecutions, FinancialLedger, and QALogs.
+- `src/operational-code/app_state_postgres.sql`: Runtime app-state tables used by the active `server.ts` PostgreSQL storage adapter.
 - `src/workflows/engineeringWorkflow.ts`: Temporal workflow definition that orchestrates the job ingestion, developer loop, QA verification, PR creation, and rollback state machine.
 - `src/agents/hermesConfig.ts`: System prompts and tool configurations for the Developer Agent (Hermes-Dev-01) and QA Agent (Hermes-SDET-01).
 - `architecture/DATA_FLOW.md`: Detailed system architecture and data flowchart.
-- `server.ts`: Express backend handling dynamic cost estimation and dispatch, integrating with Gemini and supporting high-fidelity offline execution simulations.
+- `server.ts`: Express backend handling signed sessions, GitHub OAuth callback flow, local development login, CSRF protection, RBAC, signed invitation links, encrypted integration secret storage, JSON or PostgreSQL storage, dynamic cost estimation, job APIs, ledger APIs, settings APIs, durable local queue worker, approve/merge, rollback, and local workflow execution.
 
 ## Production Readiness
 
-The UI application demonstrates the end-to-end user experience, but it utilizes a simulation mode via `server.ts` for actual long-running tasks. 
+The UI is no longer the owner of the task simulation. Jobs, logs, review state, approval, rollback, history, users, and ledger rows are now backend-owned and persisted under `.data/hermes-store.json` by default.
 
-**What is Production Ready:**
-1. **Temporal Workflow Code (`src/workflows/engineeringWorkflow.ts`)**: This code is fully typed and ready to be deployed to a Temporal worker environment.
-2. **Database Schema (`src/operational-code/schema.sql`)**: Ready for deployment to a PostgreSQL database (e.g., Cloud SQL).
-3. **Agent Configurations (`src/agents/hermesConfig.ts`)**: The system prompts and tool schemas are ready to be ingested by a framework (e.g., Langchain or the actual Hermes framework backend).
+**Implemented Backend Foundation:**
+1. **OAuth and Sessions**: GitHub OAuth is available when `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, and `APP_URL` are configured. Local admin login is available in development.
+2. **RBAC and User Administration**: Administrator and Manager roles can approve or rollback; Business Analyst users can dispatch and monitor tasks but cannot access ledger or review actions. Administrators can invite users with signed one-time links and change roles from Settings.
+3. **Persistent App State**: Users, sessions, OAuth state, jobs, logs, rollback markers, and ledger data are persisted through a storage provider. Local development uses `.data/hermes-store.json`; production can use PostgreSQL by setting `DATABASE_URL`.
+4. **Backend-Owned Workflow State**: The UI creates jobs through `/api/jobs` and polls backend state instead of running its own timed workflow.
+5. **Operational APIs**: `/api/auth/session`, `/api/invitations/accept`, `/api/jobs`, `/api/jobs/active`, `/api/ledger`, `/api/settings`, `/api/estimate-cost`, approve, and rollback endpoints are implemented.
+6. **PostgreSQL Adapter**: When `DATABASE_URL` is configured, the backend creates and uses `hermes_app_*` PostgreSQL tables with indexed columns and JSONB payloads for the current app-state contract.
+7. **Durable Local Queue**: Job dispatch persists `QUEUED` records first; a backend worker claims pending jobs, marks queue state, and requeues interrupted local work on restart.
+8. **Encrypted Integration Secrets**: Administrators can store provider credentials from Settings. Secret values are AES-256-GCM encrypted before persistence and are never returned by the API.
 
-**What is Simulated (Mocked) in the UI:**
-The UI relies on simulated backend execution delays and mock AI outputs (via `server.ts`) to mimic the asynchronous 10-minute workflow processes, because a true Temporal execution and dynamic Kubernetes sandbox spin-up would require a fully deployed infrastructure environment that is not present in this web sandbox.
+**Still Pending Production Adapters:**
+1. **Temporal Worker Runtime**: `src/workflows/engineeringWorkflow.ts` is still a typed workflow definition, not yet wired to a live worker.
+2. **PostgreSQL Domain ORM**: A PostgreSQL app-state adapter exists, but the full normalized `schema.sql` domain model still needs a Prisma/Drizzle migration and repository layer.
+3. **Kubernetes Sandbox**: QA verification logs are generated by the local backend runner until a Kubernetes job provider is connected.
+4. **GitHub App Automation**: OAuth sign-in is implemented; branch creation, commits, and PRs still need GitHub App installation-token integration.
+5. **Real Agent Loop**: Agent prompts and artifacts are structured, but the Developer/QA loop still uses the local artifact generator unless a real agent provider is connected.
 
 ## Getting Started
 
-1. Set up the development server using Vite (`npm run dev`).
-2. Run tests (once deployed).
-3. See `BUILD_PLAN.md` for remaining tasks.
+1. Copy `.env.example` to `.env` and fill in any desired providers.
+2. Run `npm run dev`.
+3. Open `http://localhost:3000`.
+4. Use **Continue as Local Admin** in development, or configure GitHub OAuth and use **Continue with GitHub**.
+5. See `BUILD_PLAN.md` for the remaining production adapter work.
+
+## Integration Secrets
+
+Administrators can configure provider credentials in Settings -> Integration Secrets. The backend stores only encrypted secret payloads and returns sanitized metadata with secret key names.
+
+Set `INTEGRATION_ENCRYPTION_KEY` in production. When it is not set, local development derives an encryption key from `SESSION_SECRET`; this is useful for development but should not be treated as production-grade key management.
+
+## Verification
+
+- `npm run lint`: TypeScript compile check.
+- `npm run build`: Production frontend and backend bundle.
+- `npm run test:backend`: Backend integration test covering session auth, CSRF, signed admin invites, invite acceptance, role changes, last-admin protection, encrypted integration secrets, Business Analyst ledger denial, and durable queue execution.
+
+## Workflow Queue
+
+`POST /api/jobs` now persists a queued job and returns immediately. The local worker polls storage, claims pending jobs, marks them `RUNNING`, and advances the stored pipeline state. If the server restarts while local work is in progress, startup recovery returns those jobs to `QUEUED` so the worker can retry them.
+
+`LOCAL_WORKER_POLL_MS` controls the local worker polling interval. Temporal remains the target production workflow runtime.
+
+## Users and Roles
+
+Roles are enforced server-side:
+
+- `ADMINISTRATOR`: Can invite users, change roles, approve/rollback work, view ledger, dispatch tasks, and manage settings.
+- `MANAGER`: Can approve/rollback work, view ledger, and dispatch tasks.
+- `BUSINESS_ANALYST`: Can dispatch and monitor tasks, but cannot approve, rollback, or view ledger data.
+
+Invited users are persisted with `INVITED` status and receive a one-time signed invite URL. Accepting the URL activates the user and creates a signed session. OAuth sign-in with the invited email still activates invited users as a compatibility path. The backend prevents removing the final active administrator.
+
+## Invitations
+
+Administrators create invites from Settings. The backend stores only a SHA-256 hash of each invite token, returns the raw token once inside the generated URL, and exposes sanitized invitation status in `/api/settings`.
+
+`INVITE_TOKEN_TTL_HOURS` controls invite link lifetime. Email delivery is still pending, so administrators currently copy the generated link from Settings.
+
+## Storage
+
+By default, the app uses the JSON storage provider at `.data/hermes-store.json`.
+
+To use PostgreSQL, set:
+
+```bash
+DATABASE_URL="postgres://user:password@host:5432/hermes"
+STORAGE_PROVIDER="postgres"
+DATABASE_SSL="true" # only when your provider requires SSL
+```
+
+On startup, `server.ts` creates the `hermes_app_*` tables described in `src/operational-code/app_state_postgres.sql`.
