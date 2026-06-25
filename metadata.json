@@ -1,0 +1,6 @@
+{
+  "name": "Hermes Multi-Agent Orchestrator",
+  "description": "Enterprise-grade multi-agent software engineering task scheduler, pipeline orchestrator, sandbox verification environment, and audit log ledger.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
