@@ -1,5 +1,46 @@
 # Changelog
 
+## [Unreleased] - Production Pending Work Audit
+
+### Added
+- Production startup validation for required `SESSION_SECRET` and `INTEGRATION_ENCRYPTION_KEY` values.
+- `GITHUB_ALLOWED_EMAIL_DOMAINS` configuration for controlled production GitHub OAuth self-provisioning.
+- `GITHUB_ALLOWED_ORGS` configuration for controlled production GitHub OAuth self-provisioning by GitHub organization membership.
+- `GITHUB_ALLOWED_TEAMS` configuration for controlled production GitHub OAuth self-provisioning by active GitHub team membership.
+- `ENABLE_LEGACY_DISPATCH` escape hatch for explicitly exposing the legacy simulation dispatch endpoint in production.
+- `ENABLE_LOCAL_WORKFLOW_RUNNER` escape hatch for explicitly allowing the local/offline workflow runner in controlled production demos or staging runs.
+- `ENABLE_LOCAL_REVIEW_ACTIONS` escape hatch for explicitly allowing local state-only approve/rollback in controlled production demos or staging runs.
+- `DEV_LOGIN_TOKEN` requirement for production dev-login when `ENABLE_DEV_LOGIN=true`.
+- `INVITE_EMAIL_WEBHOOK_URL`, `INVITE_EMAIL_WEBHOOK_TOKEN`, and `INVITE_EMAIL_WEBHOOK_TIMEOUT_MS` settings for optional invite email webhook delivery.
+- Backend integration coverage for OAuth redirect sanitization, organization/team-scope OAuth authorization, and non-admin settings metadata filtering.
+- Backend integration coverage proving production rejects local simulation job execution by default.
+- Backend integration coverage proving production dev-login requires a token and disabled local-runner recovery fails stranded jobs.
+- Backend integration coverage proving Business Analyst job responses redact actual cost, token counts, raw diffs, stdout, and test XML while admin responses retain them.
+- Backend integration coverage proving production approve/rollback reject without a real review adapter or explicit local-review escape hatch.
+- Backend integration coverage proving GitHub App credentials are consumed from encrypted storage, merged by secret key, and validated as installation-token prerequisites.
+- Backend integration coverage proving GitHub App installation-token verification calls the GitHub API with a signed JWT and does not return the token to clients.
+- Backend integration coverage proving GitHub App repository-access verification uses the installation token server-side and returns sanitized default-branch metadata without returning the token.
+- Backend integration coverage for invite webhook delivery status and payload shape.
+- Transaction-scoped PostgreSQL advisory lock around app-state mutations to serialize cross-instance read-modify-write updates.
+
+### Changed
+- Expanded `BUILD_PLAN.md` Phase 2.2 tracking with production hardening items found during repo review: OAuth admission control, production secret enforcement, settings metadata RBAC, truthful provider health/status reporting, concurrency-safe PostgreSQL repositories, simulation retirement, and integration documentation reconciliation.
+- Production GitHub OAuth now blocks uninvited self-provisioning unless the email domain is explicitly allowed, and newly admitted production OAuth users default to Business Analyst.
+- Production GitHub OAuth can also admit new users by verified membership in a configured GitHub organization or team.
+- OAuth redirect targets are normalized to safe local paths before persistence.
+- `/api/settings` now withholds user lists, invitation history, integration metadata, and stored secret key names from non-administrator sessions.
+- Runtime provider labels now report the local durable queue and local sandbox provider until real Temporal/Kubernetes execution adapters are active.
+- `doc/INTEGRATIONS.md` now distinguishes implemented OAuth, encrypted credential storage, local workflow execution, and manual invite links from pending production adapters.
+- `/api/dispatch` now returns `410 Gone` in production unless `ENABLE_LEGACY_DISPATCH=true`; `/api/jobs` remains the primary backend-owned workflow entry point.
+- `/api/jobs` now returns `503 WORKFLOW_PROVIDER_NOT_CONFIGURED` in production unless `ENABLE_LOCAL_WORKFLOW_RUNNER=true`, preventing the local artifact generator from running as implicit production execution.
+- Startup recovery now marks interrupted or queued local-runner jobs failed when the production local runner is disabled, instead of requeueing work to an inactive worker.
+- Job APIs now serialize job artifacts by caller role so Business Analysts can monitor task state without receiving manager-only review artifacts or actual ledger fields.
+- Approve and rollback endpoints now return `503 REVIEW_ADAPTER_NOT_CONFIGURED` in production unless `ENABLE_LOCAL_REVIEW_ACTIONS=true`, preventing simulated Git/Hermes review actions from being recorded as production work.
+- Stored integration updates now merge secret keys for an existing provider instead of replacing the full secret set, allowing multi-key provider credentials to be added incrementally.
+- Settings now reports GitHub App credential readiness after decrypting stored `app_id`, `installation_id`, and `private_key` values and signing a local GitHub App JWT.
+- Added admin-only GitHub App installation-token verification using `GITHUB_API_BASE_URL`, returning sanitized expiration, repository-selection, and permission metadata without exposing the access token.
+- Added admin-only GitHub App repository-access verification for `owner/repo` targets, including default branch ref lookup and sanitized repository permissions.
+
 ## [1.8.0] - Signed Invitation Links
 
 ### Added

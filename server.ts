@@ -119,6 +119,14 @@ interface IntegrationConfig {
   updatedAt: string;
 }
 
+type GitHubAppCredentialStatus =
+  | "missing"
+  | "incomplete"
+  | "decrypt_failed"
+  | "invalid_ids"
+  | "invalid_private_key"
+  | "ready";
+
 interface CostEstimate {
   estimatedCost: number;
   inputTokens: number;
@@ -182,18 +190,84 @@ type AuthedRequest = Request & { auth: AuthContext };
 const dataDir = process.env.DATA_DIR || path.join(process.cwd(), ".data");
 const storePath = path.join(dataDir, "hermes-store.json");
 const sessionCookieName = "hermes_session";
+const isProduction = process.env.NODE_ENV === "production";
+const defaultSessionSecret = "development-only-session-secret-change-before-production";
 const sessionSecret =
   process.env.SESSION_SECRET ||
-  "development-only-session-secret-change-before-production";
-const devLoginEnabled = process.env.NODE_ENV !== "production" || process.env.ENABLE_DEV_LOGIN === "true";
+  defaultSessionSecret;
+const devLoginEnabled = !isProduction || process.env.ENABLE_DEV_LOGIN === "true";
+const legacyDispatchEnabled = !isProduction || process.env.ENABLE_LEGACY_DISPATCH === "true";
+const localWorkflowRunnerEnabled = !isProduction || process.env.ENABLE_LOCAL_WORKFLOW_RUNNER === "true";
+const localReviewActionsEnabled = !isProduction || process.env.ENABLE_LOCAL_REVIEW_ACTIONS === "true";
+const devLoginToken = process.env.DEV_LOGIN_TOKEN || "";
 const localWorkerPollMs = Number(process.env.LOCAL_WORKER_POLL_MS || 1000);
 const integrationEncryptionSecret =
   process.env.INTEGRATION_ENCRYPTION_KEY ||
   `${sessionSecret}:integration-secret-development-fallback`;
 const inviteTokenTtlHours = Number(process.env.INVITE_TOKEN_TTL_HOURS || 168);
+const inviteEmailWebhookTimeoutMs = Number(process.env.INVITE_EMAIL_WEBHOOK_TIMEOUT_MS || 5000);
+const githubApiBaseUrl = (process.env.GITHUB_API_BASE_URL || "https://api.github.com").replace(/\/+$/, "");
+
+validateProductionSecrets();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function validateProductionSecret(name: string, value: string | undefined, disallowedValues: string[]) {
+  if (!value || disallowedValues.includes(value)) {
+    throw new Error(`${name} must be configured with a non-default value in production`);
+  }
+}
+
+function validateProductionSecrets() {
+  if (!isProduction) return;
+  validateProductionSecret("SESSION_SECRET", process.env.SESSION_SECRET, [
+    defaultSessionSecret,
+    "replace-with-a-long-random-secret",
+  ]);
+  validateProductionSecret("INTEGRATION_ENCRYPTION_KEY", process.env.INTEGRATION_ENCRYPTION_KEY, [
+    "replace-with-a-long-random-secret-for-integrations",
+  ]);
+  if (devLoginEnabled) {
+    validateProductionSecret("DEV_LOGIN_TOKEN", process.env.DEV_LOGIN_TOKEN, [
+      "replace-with-a-long-random-dev-login-token",
+    ]);
+  }
+}
+
+function workflowProviderStatus() {
+  if (localWorkflowRunnerEnabled) return "local-durable-queue";
+  if (process.env.TEMPORAL_ADDRESS) return "temporal-configured-no-worker-adapter";
+  return "disabled-production-local-runner";
+}
+
+function sandboxProviderStatus() {
+  if (localWorkflowRunnerEnabled) return "local-provider";
+  if (process.env.KUBERNETES_SERVICE_HOST) return "kubernetes-configured-no-sandbox-adapter";
+  return "disabled-production-local-provider";
+}
+
+function workflowExecutionAvailable() {
+  return localWorkflowRunnerEnabled;
+}
+
+function reviewActionStatus() {
+  return localReviewActionsEnabled ? "local-state-only" : "disabled-production-no-review-adapter";
+}
+
+function reviewActionsAvailable() {
+  return localReviewActionsEnabled;
+}
+
+function devLoginAuthorized(req: Request) {
+  if (!isProduction) return true;
+  const suppliedToken =
+    req.header("X-Dev-Login-Token") ||
+    (typeof req.body?.devLoginToken === "string" ? req.body.devLoginToken : "");
+  const supplied = Buffer.from(suppliedToken);
+  const expected = Buffer.from(devLoginToken);
+  return Boolean(devLoginToken && supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected));
 }
 
 function formatLogTime() {
@@ -280,14 +354,60 @@ class PostgresStoreDriver implements StoreDriver {
 
   async read() {
     await this.init();
-    const [users, sessions, oauthStates, inviteTokens, jobs, integrations] = await Promise.all([
-      this.pool.query<{ payload: AppUser }>("SELECT payload FROM hermes_app_users ORDER BY created_at ASC"),
-      this.pool.query<{ payload: SessionRecord }>("SELECT payload FROM hermes_app_sessions ORDER BY created_at ASC"),
-      this.pool.query<{ payload: OAuthStateRecord }>("SELECT payload FROM hermes_app_oauth_states ORDER BY created_at ASC"),
-      this.pool.query<{ payload: InviteTokenRecord }>("SELECT payload FROM hermes_app_invite_tokens ORDER BY created_at DESC"),
-      this.pool.query<{ payload: StoredJob }>("SELECT payload FROM hermes_app_jobs ORDER BY submitted_at DESC"),
-      this.pool.query<{ payload: IntegrationConfig }>("SELECT payload FROM hermes_app_integrations ORDER BY updated_at DESC"),
-    ]);
+    const client = await this.pool.connect();
+    try {
+      return await this.readWithClient(client);
+    } finally {
+      client.release();
+    }
+  }
+
+  async write(store: HermesStore) {
+    await this.init();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.acquireMutationLock(client);
+      await this.writeWithClient(client, store);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async mutate<T>(mutator: (store: HermesStore) => T | Promise<T>) {
+    await this.init();
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await this.acquireMutationLock(client);
+      const store = await this.readWithClient(client);
+      const result = await mutator(store);
+      await this.writeWithClient(client, store);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async acquireMutationLock(client: PoolClient) {
+    await client.query("SELECT pg_advisory_xact_lock($1, $2)", [4194304, 271828]);
+  }
+
+  private async readWithClient(client: PoolClient) {
+    const users = await client.query<{ payload: AppUser }>("SELECT payload FROM hermes_app_users ORDER BY created_at ASC");
+    const sessions = await client.query<{ payload: SessionRecord }>("SELECT payload FROM hermes_app_sessions ORDER BY created_at ASC");
+    const oauthStates = await client.query<{ payload: OAuthStateRecord }>("SELECT payload FROM hermes_app_oauth_states ORDER BY created_at ASC");
+    const inviteTokens = await client.query<{ payload: InviteTokenRecord }>("SELECT payload FROM hermes_app_invite_tokens ORDER BY created_at DESC");
+    const jobs = await client.query<{ payload: StoredJob }>("SELECT payload FROM hermes_app_jobs ORDER BY submitted_at DESC");
+    const integrations = await client.query<{ payload: IntegrationConfig }>("SELECT payload FROM hermes_app_integrations ORDER BY updated_at DESC");
 
     return {
       users: users.rows.map((row) => row.payload),
@@ -299,101 +419,83 @@ class PostgresStoreDriver implements StoreDriver {
     };
   }
 
-  async write(store: HermesStore) {
-    await this.init();
-    const client = await this.pool.connect();
-    try {
-      await client.query("BEGIN");
-      await this.replaceTable(
-        client,
-        "hermes_app_users",
-        store.users,
-        (user) => [user.id, user.email, user.createdAt, user.updatedAt, JSON.stringify(user)],
-        "id, email, created_at, updated_at, payload",
-        "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
-      );
-      await this.replaceTable(
-        client,
-        "hermes_app_sessions",
-        store.sessions,
-        (session) => [session.id, session.userId, session.expiresAt, session.createdAt, JSON.stringify(session)],
-        "id, user_id, expires_at, created_at, payload",
-        "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
-      );
-      await this.replaceTable(
-        client,
-        "hermes_app_oauth_states",
-        store.oauthStates,
-        (oauthState) => [oauthState.state, oauthState.provider, oauthState.expiresAt, oauthState.createdAt, JSON.stringify(oauthState)],
-        "state, provider, expires_at, created_at, payload",
-        "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
-      );
-      await this.replaceTable(
-        client,
-        "hermes_app_invite_tokens",
-        store.inviteTokens || [],
-        (inviteToken) => [
-          inviteToken.id,
-          inviteToken.userId,
-          inviteToken.email,
-          inviteToken.expiresAt,
-          inviteToken.acceptedAt || null,
-          inviteToken.deliveryStatus,
-          inviteToken.createdAt,
-          JSON.stringify(inviteToken),
-        ],
-        "id, user_id, email, expires_at, accepted_at, delivery_status, created_at, payload",
-        "$1, $2, $3, $4::timestamptz, $5::timestamptz, $6, $7::timestamptz, $8::jsonb",
-      );
-      await this.replaceTable(
-        client,
-        "hermes_app_jobs",
-        store.jobs,
-        (job) => [
-          job.id,
-          job.status,
-          job.currentPhase,
-          job.queueState || null,
-          job.workerId || null,
-          job.queuedAt || null,
-          job.startedAt || null,
-          job.submittedAt,
-          job.completedAt || null,
-          JSON.stringify(job),
-        ],
-        "id, status, current_phase, queue_state, worker_id, queued_at, started_at, submitted_at, completed_at, payload",
-        "$1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::timestamptz, $9::timestamptz, $10::jsonb",
-      );
-      await this.replaceTable(
-        client,
-        "hermes_app_integrations",
-        store.integrations || [],
-        (integration) => [
-          integration.id,
-          integration.provider,
-          integration.displayName,
-          integration.configuredByUserId,
-          integration.createdAt,
-          integration.updatedAt,
-          JSON.stringify(integration),
-        ],
-        "id, provider, display_name, configured_by_user_id, created_at, updated_at, payload",
-        "$1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7::jsonb",
-      );
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-
-  async mutate<T>(mutator: (store: HermesStore) => T | Promise<T>) {
-    const store = await this.read();
-    const result = await mutator(store);
-    await this.write(store);
-    return result;
+  private async writeWithClient(client: PoolClient, store: HermesStore) {
+    await this.replaceTable(
+      client,
+      "hermes_app_users",
+      store.users,
+      (user) => [user.id, user.email, user.createdAt, user.updatedAt, JSON.stringify(user)],
+      "id, email, created_at, updated_at, payload",
+      "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
+    );
+    await this.replaceTable(
+      client,
+      "hermes_app_sessions",
+      store.sessions,
+      (session) => [session.id, session.userId, session.expiresAt, session.createdAt, JSON.stringify(session)],
+      "id, user_id, expires_at, created_at, payload",
+      "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
+    );
+    await this.replaceTable(
+      client,
+      "hermes_app_oauth_states",
+      store.oauthStates,
+      (oauthState) => [oauthState.state, oauthState.provider, oauthState.expiresAt, oauthState.createdAt, JSON.stringify(oauthState)],
+      "state, provider, expires_at, created_at, payload",
+      "$1, $2, $3::timestamptz, $4::timestamptz, $5::jsonb",
+    );
+    await this.replaceTable(
+      client,
+      "hermes_app_invite_tokens",
+      store.inviteTokens || [],
+      (inviteToken) => [
+        inviteToken.id,
+        inviteToken.userId,
+        inviteToken.email,
+        inviteToken.expiresAt,
+        inviteToken.acceptedAt || null,
+        inviteToken.deliveryStatus,
+        inviteToken.createdAt,
+        JSON.stringify(inviteToken),
+      ],
+      "id, user_id, email, expires_at, accepted_at, delivery_status, created_at, payload",
+      "$1, $2, $3, $4::timestamptz, $5::timestamptz, $6, $7::timestamptz, $8::jsonb",
+    );
+    await this.replaceTable(
+      client,
+      "hermes_app_jobs",
+      store.jobs,
+      (job) => [
+        job.id,
+        job.status,
+        job.currentPhase,
+        job.queueState || null,
+        job.workerId || null,
+        job.queuedAt || null,
+        job.startedAt || null,
+        job.submittedAt,
+        job.completedAt || null,
+        JSON.stringify(job),
+      ],
+      "id, status, current_phase, queue_state, worker_id, queued_at, started_at, submitted_at, completed_at, payload",
+      "$1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz, $8::timestamptz, $9::timestamptz, $10::jsonb",
+    );
+    await this.replaceTable(
+      client,
+      "hermes_app_integrations",
+      store.integrations || [],
+      (integration) => [
+        integration.id,
+        integration.provider,
+        integration.displayName,
+        integration.configuredByUserId,
+        integration.createdAt,
+        integration.updatedAt,
+        JSON.stringify(integration),
+      ],
+      "id, provider, display_name, configured_by_user_id, created_at, updated_at, payload",
+      "$1, $2, $3, $4, $5::timestamptz, $6::timestamptz, $7::jsonb",
+    );
   }
 
   private async createSchema() {
@@ -726,6 +828,371 @@ function encryptSecret(key: string, value: string): EncryptedSecret {
   };
 }
 
+function decryptSecret(secret: EncryptedSecret) {
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    encryptionKey(),
+    Buffer.from(secret.iv, "base64url"),
+  );
+  decipher.setAuthTag(Buffer.from(secret.tag, "base64url"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(secret.ciphertext, "base64url")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
+function decryptedSecretMap(integration: IntegrationConfig) {
+  return Object.fromEntries(
+    integration.encryptedSecrets.map((secret) => [secret.key.toLowerCase(), decryptSecret(secret)]),
+  );
+}
+
+function createGitHubAppJwt(appId: string, privateKey: string) {
+  const issuedAt = Math.floor(Date.now() / 1000) - 60;
+  const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString("base64url");
+  const payload = Buffer.from(JSON.stringify({
+    iat: issuedAt,
+    exp: issuedAt + 9 * 60,
+    iss: appId,
+  })).toString("base64url");
+  const signingInput = `${header}.${payload}`;
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(signingInput), privateKey).toString("base64url");
+  return `${signingInput}.${signature}`;
+}
+
+function githubAppCredentialInputs(integrations: IntegrationConfig[]) {
+  const integration = integrations.find((candidate) => candidate.provider === "github_app");
+  if (!integration) {
+    return { ready: false, status: "missing" as GitHubAppCredentialStatus };
+  }
+
+  let secrets: Record<string, string>;
+  try {
+    secrets = decryptedSecretMap(integration);
+  } catch (error) {
+    console.error("Could not decrypt GitHub App integration secrets:", error);
+    return { ready: false, status: "decrypt_failed" as GitHubAppCredentialStatus };
+  }
+
+  const appId = integration.metadata.app_id || integration.metadata.appId || secrets.app_id || secrets.github_app_id;
+  const installationId =
+    integration.metadata.installation_id ||
+    integration.metadata.installationId ||
+    secrets.installation_id ||
+    secrets.github_installation_id;
+  const privateKey = secrets.private_key || secrets.github_private_key;
+
+  if (!appId || !installationId || !privateKey) {
+    return { ready: false, status: "incomplete" as GitHubAppCredentialStatus };
+  }
+
+  if (!/^\d+$/.test(appId) || !/^\d+$/.test(installationId)) {
+    return { ready: false, status: "invalid_ids" as GitHubAppCredentialStatus };
+  }
+
+  return {
+    ready: true,
+    status: "ready" as GitHubAppCredentialStatus,
+    appId,
+    installationId,
+    privateKey,
+  };
+}
+
+function githubAppCredentialReadiness(integrations: IntegrationConfig[]) {
+  const inputs = githubAppCredentialInputs(integrations);
+  if (!inputs.ready) return inputs;
+
+  try {
+    crypto.createPrivateKey(inputs.privateKey);
+    createGitHubAppJwt(inputs.appId, inputs.privateKey);
+  } catch (error) {
+    console.error("GitHub App private key validation failed:", error);
+    return { ready: false, status: "invalid_private_key" as GitHubAppCredentialStatus };
+  }
+
+  return { ready: true, status: "ready" as GitHubAppCredentialStatus };
+}
+
+async function exchangeGitHubAppInstallationToken(integrations: IntegrationConfig[]) {
+  const inputs = githubAppCredentialInputs(integrations);
+  if (!inputs.ready) {
+    return {
+      ok: false as const,
+      status: inputs.status,
+      statusCode: 409,
+      error: "GitHub App credentials are not ready for installation-token exchange.",
+    };
+  }
+
+  let jwt: string;
+  try {
+    crypto.createPrivateKey(inputs.privateKey);
+    jwt = createGitHubAppJwt(inputs.appId, inputs.privateKey);
+  } catch (error) {
+    console.error("GitHub App JWT creation failed:", error);
+    return {
+      ok: false as const,
+      status: "invalid_private_key" as GitHubAppCredentialStatus,
+      statusCode: 409,
+      error: "GitHub App private key is invalid.",
+    };
+  }
+
+  const response = await fetch(`${githubApiBaseUrl}/app/installations/${inputs.installationId}/access_tokens`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${jwt}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+
+  const text = await response.text();
+  const body = text ? JSON.parse(text) as {
+    token?: string;
+    expires_at?: string;
+    repository_selection?: string;
+    permissions?: Record<string, string>;
+    message?: string;
+  } : {};
+
+  if (!response.ok || !body.token) {
+    return {
+      ok: false as const,
+      status: "ready" as GitHubAppCredentialStatus,
+      statusCode: 502,
+      error: body.message || "GitHub App installation-token exchange failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    status: "ready" as GitHubAppCredentialStatus,
+    token: body.token,
+    installationId: inputs.installationId,
+    expiresAt: body.expires_at || null,
+    repositorySelection: body.repository_selection || null,
+    permissions: body.permissions || {},
+  };
+}
+
+async function verifyGitHubAppInstallationAccess(integrations: IntegrationConfig[]) {
+  const result = await exchangeGitHubAppInstallationToken(integrations);
+  if (result.ok === false) return result;
+  return {
+    ok: true as const,
+    status: result.status,
+    installationId: result.installationId,
+    expiresAt: result.expiresAt,
+    repositorySelection: result.repositorySelection,
+    permissions: result.permissions,
+  };
+}
+
+function parseGitHubRepository(value: unknown) {
+  const candidate = typeof value === "string" ? value.trim() : "";
+  const match = candidate.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)$/);
+  if (!match) return null;
+  return {
+    owner: match[1],
+    repo: match[2],
+    fullName: `${match[1]}/${match[2]}`,
+  };
+}
+
+async function readGitHubJson<T>(url: string, token: string) {
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  const text = await response.text();
+  const body = text ? JSON.parse(text) as T & { message?: string } : {} as T & { message?: string };
+  return { response, body };
+}
+
+async function writeGitHubJson<T>(url: string, token: string, body: unknown) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  const responseBody = text ? JSON.parse(text) as T & { message?: string } : {} as T & { message?: string };
+  return { response, body: responseBody };
+}
+
+async function readGitHubRepositorySnapshot(token: string, repositoryName: string) {
+  const repository = parseGitHubRepository(repositoryName);
+  if (!repository) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Repository must be formatted as owner/repo.",
+    };
+  }
+
+  const repoUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}`;
+  const repoResult = await readGitHubJson<{
+    full_name?: string;
+    default_branch?: string;
+    private?: boolean;
+    permissions?: Record<string, boolean>;
+  }>(repoUrl, tokenResult.token);
+
+  if (!repoResult.response.ok || !repoResult.body.full_name || !repoResult.body.default_branch) {
+    return {
+      ok: false as const,
+      statusCode: 502,
+      error: repoResult.body.message || "GitHub App repository access verification failed.",
+    };
+  }
+
+  const refUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/ref/heads/${encodeURIComponent(repoResult.body.default_branch)}`;
+  const refResult = await readGitHubJson<{
+    object?: {
+      sha?: string;
+      type?: string;
+    };
+  }>(refUrl, tokenResult.token);
+
+  if (!refResult.response.ok || !refResult.body.object?.sha) {
+    return {
+      ok: false as const,
+      statusCode: 502,
+      error: refResult.body.message || "GitHub App default branch verification failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: repoResult.body.full_name,
+    defaultBranch: repoResult.body.default_branch,
+    defaultBranchSha: refResult.body.object.sha,
+    defaultBranchObjectType: refResult.body.object.type || null,
+    private: Boolean(repoResult.body.private),
+    permissions: repoResult.body.permissions || {},
+    owner: repository.owner,
+    repo: repository.repo,
+  };
+}
+
+async function verifyGitHubAppRepositoryAccess(integrations: IntegrationConfig[], repositoryName: string) {
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const snapshot = await readGitHubRepositorySnapshot(tokenResult.token, repositoryName);
+  if (snapshot.ok === false) return snapshot;
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: snapshot.repository,
+    defaultBranch: snapshot.defaultBranch,
+    defaultBranchSha: snapshot.defaultBranchSha,
+    defaultBranchObjectType: snapshot.defaultBranchObjectType,
+    private: snapshot.private,
+    permissions: snapshot.permissions,
+    installation: {
+      installationId: tokenResult.installationId,
+      expiresAt: tokenResult.expiresAt,
+      repositorySelection: tokenResult.repositorySelection,
+      permissions: tokenResult.permissions,
+    },
+  };
+}
+
+function validateGitBranchName(branchName: unknown) {
+  const branch = typeof branchName === "string" ? branchName.trim() : "";
+  if (!branch) return null;
+  if (branch.length > 180) return null;
+  if (
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.includes("..") ||
+    branch.includes("//") ||
+    branch.includes("@{") ||
+    branch.includes("\\") ||
+    branch.split("/").some((part) => !part || part.endsWith(".lock"))
+  ) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(branch)) return null;
+  return branch;
+}
+
+async function createGitHubAppBranch(integrations: IntegrationConfig[], repositoryName: string, branchName: unknown) {
+  const branch = validateGitBranchName(branchName);
+  if (!branch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid branchName is required.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const snapshot = await readGitHubRepositorySnapshot(tokenResult.token, repositoryName);
+  if (snapshot.ok === false) return snapshot;
+
+  const createRefUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repo)}/git/refs`;
+  const createRef = await writeGitHubJson<{
+    ref?: string;
+    object?: {
+      sha?: string;
+      type?: string;
+    };
+  }>(createRefUrl, tokenResult.token, {
+    ref: `refs/heads/${branch}`,
+    sha: snapshot.defaultBranchSha,
+  });
+
+  if (!createRef.response.ok || !createRef.body.ref || !createRef.body.object?.sha) {
+    const message = createRef.body.message || "GitHub App branch creation failed.";
+    return {
+      ok: false as const,
+      statusCode: createRef.response.status === 422 ? 409 : 502,
+      error: message,
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: snapshot.repository,
+    sourceBranch: snapshot.defaultBranch,
+    sourceSha: snapshot.defaultBranchSha,
+    branchName: branch,
+    ref: createRef.body.ref,
+    branchSha: createRef.body.object.sha,
+    branchObjectType: createRef.body.object.type || null,
+  };
+}
+
 function sanitizeIntegration(integration: IntegrationConfig) {
   return {
     id: integration.id,
@@ -746,6 +1213,7 @@ async function findOrCreateUser(params: {
   providerId?: string;
   avatarUrl?: string;
   role?: UserRole;
+  allowCreate?: boolean;
 }) {
   return mutateStore((store) => {
     const email = params.email.toLowerCase();
@@ -759,6 +1227,10 @@ async function findOrCreateUser(params: {
       existing.lastLoginAt = nowIso();
       existing.updatedAt = nowIso();
       return existing;
+    }
+
+    if (params.allowCreate === false) {
+      return null;
     }
 
     const firstUserRole: UserRole = store.users.length === 0 ? "ADMINISTRATOR" : "MANAGER";
@@ -798,18 +1270,47 @@ function estimateCostForTask(taskDescription: string): CostEstimate {
   };
 }
 
-function jobToPipelineState(job: StoredJob) {
+function canViewJobArtifacts(role: UserRole) {
+  return role !== "BUSINESS_ANALYST";
+}
+
+function jobResultForRole(job: StoredJob, role: UserRole) {
+  if (!job.result) return null;
+  if (canViewJobArtifacts(role)) return job.result;
+
+  return {
+    ...job.result,
+    iterations: job.result.iterations.map((iteration) => ({
+      ...iteration,
+      codeDiff: "Restricted to Manager and Administrator roles.",
+      testResultsXml: "Restricted to Manager and Administrator roles.",
+      stdout: "Restricted to Manager and Administrator roles.",
+    })),
+    finalPr: {
+      prTitle: job.result.finalPr.prTitle,
+      prDescription: job.result.finalPr.prDescription,
+      testCoverage: job.result.finalPr.testCoverage,
+    },
+  };
+}
+
+function jobLogsForRole(job: StoredJob, role: UserRole) {
+  if (canViewJobArtifacts(role)) return job.logs;
+  return job.logs.filter((line) => !line.includes("[LEDGER]"));
+}
+
+function jobToPipelineState(job: StoredJob, role: UserRole) {
   return {
     phaseIndex: job.phaseIndex,
     runningText: job.runningText,
-    jobData: job.result || null,
+    jobData: jobResultForRole(job, role),
     activeIterationIndex: job.activeIterationIndex,
-    logs: job.logs,
+    logs: jobLogsForRole(job, role),
     terminalStatus: job.terminalStatus,
   };
 }
 
-function jobToClient(job: StoredJob) {
+function jobToClient(job: StoredJob, role: UserRole) {
   return {
     id: job.id,
     executionId: job.executionId,
@@ -829,8 +1330,8 @@ function jobToClient(job: StoredJob) {
     assignedTo: job.assignedTo,
     estimate: job.estimate,
     createdByUserId: job.createdByUserId,
-    pipelineState: jobToPipelineState(job),
-    result: job.result || null,
+    pipelineState: jobToPipelineState(job, role),
+    result: jobResultForRole(job, role),
   };
 }
 
@@ -1079,21 +1580,46 @@ async function runLocalWorkflow(jobId: string) {
 
 async function recoverInterruptedJobs() {
   await mutateStore((store) => {
+    const markLocalRunnerUnavailable = (job: StoredJob, contextLine?: string) => {
+      job.status = "FAILED";
+      job.queueState = "FAILED";
+      job.workerId = undefined;
+      job.currentPhase = "FAILED";
+      job.runningText = "Workflow adapter unavailable after server restart";
+      job.terminalStatus = "REJECTED";
+      job.lastError = "Local workflow runner is disabled and no production workflow adapter is active.";
+      job.completedAt = nowIso();
+      const lines = [
+        contextLine,
+        `[${formatLogTime()}] [RECOVERY] Marked job failed because the local workflow runner is disabled.`,
+      ].filter((line): line is string => Boolean(line));
+      appendJobLog(job, lines);
+    };
+
     for (const job of store.jobs) {
       if (job.status === "IN_PROGRESS") {
-        job.status = "QUEUED";
-        job.queueState = "PENDING";
         job.workerId = undefined;
-        job.currentPhase = "DISPATCHED_TO_QUEUE";
-        job.runningText = "Workflow requeued after server restart";
-        job.terminalStatus = "PROVISIONING";
-        appendJobLog(job, [
-          `[${formatLogTime()}] [RECOVERY] Server restarted while this local workflow was running.`,
-          `[${formatLogTime()}] [RECOVERY] Requeued job for a clean worker retry.`,
-        ]);
+        if (localWorkflowRunnerEnabled) {
+          job.status = "QUEUED";
+          job.queueState = "PENDING";
+          job.currentPhase = "DISPATCHED_TO_QUEUE";
+          job.runningText = "Workflow requeued after server restart";
+          job.terminalStatus = "PROVISIONING";
+          appendJobLog(job, [
+            `[${formatLogTime()}] [RECOVERY] Server restarted while this local workflow was running.`,
+            `[${formatLogTime()}] [RECOVERY] Requeued job for a clean worker retry.`,
+          ]);
+        } else {
+          const interruptedMessage = `[${formatLogTime()}] [RECOVERY] Server restarted while this local workflow was running.`;
+          markLocalRunnerUnavailable(job, interruptedMessage);
+        }
       } else if (job.status === "QUEUED") {
-        job.queueState = "PENDING";
-        job.workerId = undefined;
+        if (localWorkflowRunnerEnabled) {
+          job.queueState = "PENDING";
+          job.workerId = undefined;
+        } else {
+          markLocalRunnerUnavailable(job);
+        }
       }
     }
   });
@@ -1101,6 +1627,114 @@ async function recoverInterruptedJobs() {
 
 function githubOAuthConfigured() {
   return Boolean(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET);
+}
+
+function csvEnv(name: string) {
+  return (process.env[name] || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function githubEmailDomainAllowed(email: string) {
+  const domain = email.toLowerCase().split("@").pop();
+  if (!domain) return false;
+  return csvEnv("GITHUB_ALLOWED_EMAIL_DOMAINS")
+    .map((allowed) => allowed.replace(/^@/, ""))
+    .includes(domain);
+}
+
+function githubAllowedOrgs() {
+  return csvEnv("GITHUB_ALLOWED_ORGS");
+}
+
+function githubAllowedTeams() {
+  return csvEnv("GITHUB_ALLOWED_TEAMS")
+    .map((team) => {
+      const [org, slug] = team.split("/");
+      if (!org || !slug) return null;
+      return { org, slug };
+    })
+    .filter((team): team is { org: string; slug: string } => Boolean(team));
+}
+
+function githubOAuthScopes() {
+  const scopes = new Set((process.env.GITHUB_OAUTH_SCOPES || "read:user user:email repo").split(/\s+/).filter(Boolean));
+  if (githubAllowedOrgs().length > 0 || githubAllowedTeams().length > 0) {
+    scopes.add("read:org");
+  }
+  return Array.from(scopes).join(" ");
+}
+
+async function githubOrgAllowed(accessToken: string) {
+  const allowedOrgs = githubAllowedOrgs();
+  if (allowedOrgs.length === 0) return false;
+
+  const orgsResponse = await fetch("https://api.github.com/user/orgs?per_page=100", {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/vnd.github+json",
+    },
+  });
+
+  if (!orgsResponse.ok) {
+    throw new Error("GitHub organization membership check failed");
+  }
+
+  const orgs = await orgsResponse.json() as Array<{ login?: string }>;
+  const userOrgs = new Set(orgs.map((org) => org.login?.toLowerCase()).filter(Boolean));
+  return allowedOrgs.some((org) => userOrgs.has(org));
+}
+
+async function githubTeamAllowed(accessToken: string, username: string) {
+  const allowedTeams = githubAllowedTeams();
+  if (allowedTeams.length === 0) return false;
+
+  for (const team of allowedTeams) {
+    const teamResponse = await fetch(`https://api.github.com/orgs/${encodeURIComponent(team.org)}/teams/${encodeURIComponent(team.slug)}/memberships/${encodeURIComponent(username)}`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/vnd.github+json",
+      },
+    });
+
+    if (teamResponse.status === 404) {
+      continue;
+    }
+    if (!teamResponse.ok) {
+      throw new Error("GitHub team membership check failed");
+    }
+
+    const membership = await teamResponse.json() as { state?: string };
+    if (membership.state === "active") {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+async function githubOAuthCanCreateUser(email: string, accessToken: string, username: string) {
+  if (!isProduction) return true;
+  if (githubEmailDomainAllowed(email)) return true;
+  if (await githubOrgAllowed(accessToken)) return true;
+  return githubTeamAllowed(accessToken, username);
+}
+
+function safeRedirectPath(value: unknown) {
+  if (typeof value !== "string") return "/";
+  const candidate = value.trim();
+  if (!candidate || !candidate.startsWith("/") || candidate.startsWith("//") || candidate.includes("\\")) {
+    return "/";
+  }
+
+  try {
+    const parsed = new URL(candidate, "http://axiom.local");
+    if (parsed.origin !== "http://axiom.local") return "/";
+    return `${parsed.pathname}${parsed.search}${parsed.hash}` || "/";
+  } catch {
+    return "/";
+  }
 }
 
 function appBaseUrl(req: Request) {
@@ -1114,6 +1748,49 @@ function invitationUrl(req: Request, token: string) {
   return `${appBaseUrl(req)}/?invite=${encodeURIComponent(token)}`;
 }
 
+async function deliverInviteEmail(params: {
+  email: string;
+  fullName: string;
+  role: UserRole;
+  inviteUrl: string;
+  expiresAt: string;
+  invitedByEmail: string;
+}): Promise<InviteDeliveryStatus> {
+  const webhookUrl = process.env.INVITE_EMAIL_WEBHOOK_URL?.trim();
+  if (!webhookUrl) return "LOCAL_ONLY";
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), Number.isFinite(inviteEmailWebhookTimeoutMs) ? inviteEmailWebhookTimeoutMs : 5000);
+  try {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (process.env.INVITE_EMAIL_WEBHOOK_TOKEN) {
+      headers.Authorization = `Bearer ${process.env.INVITE_EMAIL_WEBHOOK_TOKEN}`;
+    }
+
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers,
+      signal: controller.signal,
+      body: JSON.stringify({
+        to: params.email,
+        fullName: params.fullName,
+        role: params.role,
+        inviteUrl: params.inviteUrl,
+        expiresAt: params.expiresAt,
+        invitedByEmail: params.invitedByEmail,
+      }),
+    });
+    return response.ok ? "DELIVERED" : "FAILED";
+  } catch (error) {
+    console.error("Invitation email delivery failed:", error);
+    return "FAILED";
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({
@@ -1124,10 +1801,16 @@ app.get("/api/health", (req, res) => {
       devLoginEnabled,
     },
     providers: {
-      workflow: process.env.TEMPORAL_ADDRESS ? "temporal-configured" : "local-durable-queue",
+      workflow: workflowProviderStatus(),
       database: storageProvider.kind === "postgres" ? "postgres-configured" : "json-store",
-      sandbox: process.env.KUBERNETES_SERVICE_HOST ? "kubernetes-configured" : "local-provider",
+      sandbox: sandboxProviderStatus(),
       github: githubOAuthConfigured() ? "oauth-configured" : "not-configured",
+    },
+    execution: {
+      jobDispatchEnabled: workflowExecutionAvailable(),
+      reviewActionsEnabled: reviewActionsAvailable(),
+      localWorkflowRunnerEnabled,
+      localReviewActionsEnabled,
     },
   });
 });
@@ -1153,6 +1836,9 @@ app.post("/api/auth/dev-login", async (req, res, next) => {
   try {
     if (!devLoginEnabled) {
       return res.status(403).json({ error: "Local development login is disabled" });
+    }
+    if (!devLoginAuthorized(req)) {
+      return res.status(403).json({ error: "Development login token is invalid or missing" });
     }
 
     const requestedRole = req.body?.role as UserRole | undefined;
@@ -1299,7 +1985,7 @@ app.get("/api/auth/github", async (req, res, next) => {
     }
 
     const state = crypto.randomBytes(24).toString("base64url");
-    const redirectPath = typeof req.query.redirect === "string" ? req.query.redirect : "/";
+    const redirectPath = safeRedirectPath(req.query.redirect);
     await mutateStore((store) => {
       store.oauthStates = store.oauthStates.filter((record) => new Date(record.expiresAt).getTime() > Date.now());
       store.oauthStates.push({
@@ -1314,7 +2000,7 @@ app.get("/api/auth/github", async (req, res, next) => {
     const params = new URLSearchParams({
       client_id: process.env.GITHUB_CLIENT_ID!,
       redirect_uri: `${appBaseUrl(req)}/api/auth/github/callback`,
-      scope: process.env.GITHUB_OAUTH_SCOPES || "read:user user:email repo",
+      scope: githubOAuthScopes(),
       state,
     });
 
@@ -1401,7 +2087,12 @@ app.get("/api/auth/github/callback", async (req, res, next) => {
       provider: "github",
       providerId: String(githubUser.id),
       avatarUrl: githubUser.avatar_url,
+      role: isProduction ? "BUSINESS_ANALYST" : undefined,
+      allowCreate: await githubOAuthCanCreateUser(email, tokenBody.access_token, githubUser.login),
     });
+    if (!user) {
+      return res.status(403).send("GitHub account is not invited or allowed for this workspace.");
+    }
     const session = await createSession(user.id);
     setSessionCookie(res, session.id);
     res.redirect(oauthState.redirectPath || "/");
@@ -1779,9 +2470,10 @@ If tests fail, provide objective trace logs and architectural critiques. If test
 
 app.get("/api/jobs", requireAuth, async (req, res, next) => {
   try {
+    const auth = (req as AuthedRequest).auth;
     const store = await readStore();
     res.json({
-      jobs: store.jobs.map(jobToClient),
+      jobs: store.jobs.map((job) => jobToClient(job, auth.user.role)),
       history: store.jobs.map(jobToHistory),
     });
   } catch (error) {
@@ -1791,12 +2483,13 @@ app.get("/api/jobs", requireAuth, async (req, res, next) => {
 
 app.get("/api/jobs/active", requireAuth, async (req, res, next) => {
   try {
+    const auth = (req as AuthedRequest).auth;
     const store = await readStore();
     const active =
       store.jobs.find((job) => job.status === "IN_PROGRESS" || job.status === "QUEUED" || job.status === "REVIEW_READY") ||
       store.jobs[0] ||
       null;
-    res.json({ job: active ? jobToClient(active) : null });
+    res.json({ job: active ? jobToClient(active, auth.user.role) : null });
   } catch (error) {
     next(error);
   }
@@ -1804,12 +2497,13 @@ app.get("/api/jobs/active", requireAuth, async (req, res, next) => {
 
 app.get("/api/jobs/:jobId", requireAuth, async (req, res, next) => {
   try {
+    const auth = (req as AuthedRequest).auth;
     const store = await readStore();
     const job = store.jobs.find((candidate) => candidate.id === req.params.jobId);
     if (!job) {
       return res.status(404).json({ error: "Job not found" });
     }
-    res.json({ job: jobToClient(job) });
+    res.json({ job: jobToClient(job, auth.user.role) });
   } catch (error) {
     next(error);
   }
@@ -1890,11 +2584,31 @@ app.post(
         return res.status(409).json({ error: "User already has an active account" });
       }
 
+      const inviteUrlValue = invitationUrl(req, rawToken);
+      const deliveryStatus = await deliverInviteEmail({
+        email: invitedUser.user.email,
+        fullName: invitedUser.user.fullName,
+        role: invitedUser.user.role,
+        inviteUrl: inviteUrlValue,
+        expiresAt: invitedUser.inviteToken.expiresAt,
+        invitedByEmail: auth.user.email,
+      });
+
+      if (deliveryStatus !== invitedUser.inviteToken.deliveryStatus) {
+        await mutateStore((store) => {
+          const inviteToken = (store.inviteTokens || []).find((candidate) => candidate.id === invitedUser.inviteToken.id);
+          if (inviteToken) {
+            inviteToken.deliveryStatus = deliveryStatus;
+            invitedUser.inviteToken.deliveryStatus = deliveryStatus;
+          }
+        });
+      }
+
       res.status(201).json({
         user: sanitizeUser(invitedUser.user),
         invite: {
           ...sanitizeInviteToken(invitedUser.inviteToken),
-          url: invitationUrl(req, rawToken),
+          url: inviteUrlValue,
         },
       });
     } catch (error) {
@@ -1983,9 +2697,16 @@ app.post(
       const integration = await mutateStore((store) => {
         const existing = (store.integrations || []).find((candidate) => candidate.provider === provider);
         if (existing) {
+          const submittedKeys = new Set(encryptedSecrets.map((secret) => secret.key.toLowerCase()));
           existing.displayName = cleanDisplayName;
-          existing.metadata = cleanMetadata;
-          existing.encryptedSecrets = encryptedSecrets;
+          existing.metadata = {
+            ...existing.metadata,
+            ...cleanMetadata,
+          };
+          existing.encryptedSecrets = [
+            ...existing.encryptedSecrets.filter((secret) => !submittedKeys.has(secret.key.toLowerCase())),
+            ...encryptedSecrets,
+          ];
           existing.configuredByUserId = auth.user.id;
           existing.updatedAt = nowIso();
           return existing;
@@ -2007,6 +2728,108 @@ app.post(
       });
 
       res.status(201).json({ integration: sanitizeIntegration(integration) });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/verify",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const store = await readStore();
+      const result = await verifyGitHubAppInstallationAccess(store.integrations || []);
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          credentialStatus: result.status,
+          error: result.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        credentialStatus: result.status,
+        installationId: result.installationId,
+        expiresAt: result.expiresAt,
+        repositorySelection: result.repositorySelection,
+        permissions: result.permissions,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/repository/verify",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await verifyGitHubAppRepositoryAccess(store.integrations || [], repository);
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        defaultBranch: result.defaultBranch,
+        defaultBranchSha: result.defaultBranchSha,
+        defaultBranchObjectType: result.defaultBranchObjectType,
+        private: result.private,
+        permissions: result.permissions,
+        installation: result.installation,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/branches",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await createGitHubAppBranch(store.integrations || [], repository, req.body?.branchName);
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.status(201).json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        sourceBranch: result.sourceBranch,
+        sourceSha: result.sourceSha,
+        branchName: result.branchName,
+        ref: result.ref,
+        branchSha: result.branchSha,
+        branchObjectType: result.branchObjectType,
+        tokenReceived: true,
+      });
     } catch (error) {
       next(error);
     }
@@ -2046,6 +2869,12 @@ app.post(
     try {
       const auth = (req as AuthedRequest).auth;
       const { taskDescription, developerRole, qaRole, targetRepository } = req.body;
+      if (!workflowExecutionAvailable()) {
+        return res.status(503).json({
+          code: "WORKFLOW_PROVIDER_NOT_CONFIGURED",
+          error: "Production job execution requires a live workflow adapter. The local simulation runner is disabled; set ENABLE_LOCAL_WORKFLOW_RUNNER=true only for controlled staging or demo runs.",
+        });
+      }
       if (!taskDescription || typeof taskDescription !== "string") {
         return res.status(400).json({ error: "Task description is required" });
       }
@@ -2087,7 +2916,7 @@ app.post(
       await mutateStore((store) => {
         store.jobs.unshift(job);
       });
-      res.status(201).json({ job: jobToClient(job) });
+      res.status(201).json({ job: jobToClient(job, auth.user.role) });
     } catch (error) {
       next(error);
     }
@@ -2101,6 +2930,14 @@ app.post(
   requireRole(["ADMINISTRATOR", "MANAGER"]),
   async (req, res, next) => {
     try {
+      const auth = (req as AuthedRequest).auth;
+      if (!reviewActionsAvailable()) {
+        return res.status(503).json({
+          code: "REVIEW_ADAPTER_NOT_CONFIGURED",
+          error: "Production approve-and-merge requires a live GitHub App adapter. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+        });
+      }
+
       const job = await updateJob(req.params.jobId, (candidate) => {
         if (candidate.status !== "REVIEW_READY") return;
         candidate.status = "COMPLETED";
@@ -2124,7 +2961,7 @@ app.post(
       if (job.status !== "COMPLETED") {
         return res.status(409).json({ error: "Job is not ready for approval" });
       }
-      res.json({ job: jobToClient(job) });
+      res.json({ job: jobToClient(job, auth.user.role) });
     } catch (error) {
       next(error);
     }
@@ -2138,6 +2975,14 @@ app.post(
   requireRole(["ADMINISTRATOR", "MANAGER"]),
   async (req, res, next) => {
     try {
+      const auth = (req as AuthedRequest).auth;
+      if (!reviewActionsAvailable()) {
+        return res.status(503).json({
+          code: "REVIEW_ADAPTER_NOT_CONFIGURED",
+          error: "Production rollback requires live GitHub App and Hermes memory adapters. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+        });
+      }
+
       const job = await updateJob(req.params.jobId, (candidate) => {
         if (candidate.status !== "REVIEW_READY" && candidate.status !== "FAILED") return;
         candidate.status = "ROLLED_BACK";
@@ -2167,7 +3012,7 @@ app.post(
       if (job.status !== "ROLLED_BACK") {
         return res.status(409).json({ error: "Job cannot be rolled back from its current state" });
       }
-      res.json({ job: jobToClient(job) });
+      res.json({ job: jobToClient(job, auth.user.role) });
     } catch (error) {
       next(error);
     }
@@ -2202,11 +3047,14 @@ app.get("/api/ledger", requireAuth, async (req, res, next) => {
 
 app.get("/api/settings", requireAuth, async (req, res, next) => {
   try {
+    const auth = (req as AuthedRequest).auth;
+    const canViewSensitiveSettings = auth.user.role === "ADMINISTRATOR";
     const store = await readStore();
+    const githubAppReadiness = githubAppCredentialReadiness(store.integrations || []);
     res.json({
-      users: store.users.map(sanitizeUser),
-      invitations: (store.inviteTokens || []).map(sanitizeInviteToken),
-      integrationConfigs: (store.integrations || []).map(sanitizeIntegration),
+      users: canViewSensitiveSettings ? store.users.map(sanitizeUser) : [],
+      invitations: canViewSensitiveSettings ? (store.inviteTokens || []).map(sanitizeInviteToken) : [],
+      integrationConfigs: canViewSensitiveSettings ? (store.integrations || []).map(sanitizeIntegration) : [],
       integrations: {
         githubOAuthConfigured: githubOAuthConfigured(),
         geminiConfigured: Boolean(ai),
@@ -2214,11 +3062,18 @@ app.get("/api/settings", requireAuth, async (req, res, next) => {
         postgresConfigured: storageProvider.kind === "postgres",
         kubernetesConfigured: Boolean(process.env.KUBERNETES_SERVICE_HOST),
         secretStorageConfigured: Boolean(process.env.INTEGRATION_ENCRYPTION_KEY),
+        githubAppCredentialReady: githubAppReadiness.ready,
+        githubAppCredentialStatus: githubAppReadiness.status,
       },
       runtime: {
         dataStore: storageProvider.kind,
-        workflowProvider: process.env.TEMPORAL_ADDRESS ? "temporal" : "local-durable-queue",
-        sandboxProvider: process.env.KUBERNETES_SERVICE_HOST ? "kubernetes" : "local-provider",
+        workflowProvider: workflowProviderStatus(),
+        sandboxProvider: sandboxProviderStatus(),
+        reviewActionProvider: reviewActionStatus(),
+        jobDispatchEnabled: workflowExecutionAvailable(),
+        reviewActionsEnabled: reviewActionsAvailable(),
+        localWorkflowRunnerEnabled,
+        localReviewActionsEnabled,
       },
     });
   } catch (error) {
@@ -2229,6 +3084,12 @@ app.get("/api/settings", requireAuth, async (req, res, next) => {
 // Full Dispatch API - optionally calling Google Gemini API if live, else using high fidelity offline fallback
 app.post("/api/dispatch", requireAuth, requireCsrf, async (req, res) => {
   const { taskDescription, developerRole, qaRole } = req.body;
+
+  if (!legacyDispatchEnabled) {
+    return res.status(410).json({
+      error: "Legacy simulation dispatch is disabled in production. Use /api/jobs and production workflow adapters.",
+    });
+  }
 
   if (!taskDescription) {
     return res.status(400).json({ error: "Task description is required" });
@@ -2383,7 +3244,7 @@ let clientMiddlewareInstalled = false;
 export async function startServer(options: StartServerOptions = {}) {
   await storageProvider.init();
   await recoverInterruptedJobs();
-  if (options.startWorker !== false) {
+  if (options.startWorker !== false && localWorkflowRunnerEnabled) {
     startLocalWorkflowWorker();
   }
 

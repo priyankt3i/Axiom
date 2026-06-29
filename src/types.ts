@@ -13,10 +13,10 @@ export interface FinalPr {
   prTitle: string;
   prDescription: string;
   testCoverage: number;
-  actualCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  computeMs: number;
+  actualCost?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+  computeMs?: number;
 }
 
 export interface PipelineJob {
@@ -185,10 +185,17 @@ export interface SettingsPayload {
     postgresConfigured: boolean;
     kubernetesConfigured: boolean;
     secretStorageConfigured: boolean;
+    githubAppCredentialReady: boolean;
+    githubAppCredentialStatus: string;
   };
   runtime: {
     dataStore: string;
     workflowProvider: string;
     sandboxProvider: string;
+    reviewActionProvider: string;
+    jobDispatchEnabled: boolean;
+    reviewActionsEnabled: boolean;
+    localWorkflowRunnerEnabled: boolean;
+    localReviewActionsEnabled: boolean;
   };
 }

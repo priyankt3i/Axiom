@@ -9,6 +9,11 @@ interface AuditTabProps {
 }
 
 export function AuditTab({ jobData, onRollback, onApproveMerge, canReview }: AuditTabProps) {
+  const costLabel =
+    typeof jobData.finalPr.actualCost === "number"
+      ? `Total Cost: $${jobData.finalPr.actualCost.toFixed(5)} USD`
+      : "Cost restricted";
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       
@@ -24,7 +29,7 @@ export function AuditTab({ jobData, onRollback, onApproveMerge, canReview }: Aud
             </h1>
           </div>
           <p className="text-xs text-slate-500 mt-1">
-            Branch: {jobData.gitBranch} • Total Cost: ${jobData.finalPr.actualCost.toFixed(5)} USD
+            Branch: {jobData.gitBranch} • {costLabel}
           </p>
         </div>
         

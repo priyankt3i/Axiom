@@ -185,6 +185,16 @@ export function SettingsTab({
                   </a>
                 </div>
               </div>
+              <div className="flex items-center justify-between border-b border-[#E2E8F0] pb-4">
+                <div>
+                  <div className="text-sm font-bold text-slate-800">GitHub App Credentials</div>
+                  <div className="text-xs text-[#475569]">Status: {settings?.integrations.githubAppCredentialStatus || "missing"}</div>
+                </div>
+                <StatusBadge
+                  active={Boolean(settings?.integrations.githubAppCredentialReady)}
+                  label={settings?.integrations.githubAppCredentialReady ? "Ready" : "Not Ready"}
+                />
+              </div>
               <div className="flex items-center justify-between">
                 <div>
                   <div className="text-sm font-bold text-slate-800">Gemini Agent Output Provider</div>
