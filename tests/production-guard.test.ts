@@ -13,6 +13,12 @@ process.env.ENABLE_DEV_LOGIN = "true";
 process.env.DEV_LOGIN_TOKEN = "production-guard-dev-login-token";
 delete process.env.ENABLE_LOCAL_WORKFLOW_RUNNER;
 delete process.env.ENABLE_LOCAL_REVIEW_ACTIONS;
+delete process.env.ENABLE_GITHUB_APP_REVIEW_ACTIONS;
+delete process.env.ENABLE_GITHUB_APP_ROLLBACK_ACTIONS;
+delete process.env.HERMES_MEMORY_EVICTION_WEBHOOK_URL;
+delete process.env.HERMES_MEMORY_EVICTION_WEBHOOK_TOKEN;
+delete process.env.SANDBOX_PROVIDER;
+delete process.env.PODMAN_BIN;
 process.env.GEMINI_API_KEY = "MY_GEMINI_API_KEY";
 process.env.DATA_DIR = dataDir;
 process.env.STORAGE_PROVIDER = "json";
@@ -240,7 +246,7 @@ test("production rejects local simulation job execution by default", async () =>
   });
   const rollbackRejected = await readJson<{ code: string; error: string }>(response);
   assert.equal(response.status, 503);
-  assert.equal(rollbackRejected.code, "REVIEW_ADAPTER_NOT_CONFIGURED");
+  assert.equal(rollbackRejected.code, "ROLLBACK_ADAPTER_NOT_CONFIGURED");
   assert.match(rollbackRejected.error, /rollback requires live github app and hermes memory adapters/i);
 
   const finalStore = JSON.parse(await fs.readFile(path.join(dataDir, "hermes-store.json"), "utf8")) as {

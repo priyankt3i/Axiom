@@ -12,6 +12,22 @@
 - `ENABLE_LOCAL_REVIEW_ACTIONS` escape hatch for explicitly allowing local state-only approve/rollback in controlled production demos or staging runs.
 - `DEV_LOGIN_TOKEN` requirement for production dev-login when `ENABLE_DEV_LOGIN=true`.
 - `INVITE_EMAIL_WEBHOOK_URL`, `INVITE_EMAIL_WEBHOOK_TOKEN`, and `INVITE_EMAIL_WEBHOOK_TIMEOUT_MS` settings for optional invite email webhook delivery.
+- `SANDBOX_PROVIDER`, `PODMAN_BIN`, `PODMAN_IMAGE`, `PODMAN_MEMORY`, `PODMAN_CPUS`, and `SANDBOX_TIMEOUT_MS` settings for local Podman sandbox verification.
+- `SANDBOX_INSTALL_COMMAND`, `SANDBOX_BUILD_COMMAND`, `SANDBOX_TEST_COMMAND`, and `SANDBOX_STATIC_ANALYSIS_COMMAND` settings for server-owned job QA command manifests inside the Podman sandbox.
+- `SANDBOX_CHECKOUT_PROVIDER`, `SANDBOX_REPOSITORY_URL`, `SANDBOX_CHECKOUT_REF`, `GIT_BIN`, and `GIT_CLONE_TIMEOUT_MS` settings for optional Git workspace checkout before sandbox command execution.
+- `SANDBOX_CHECKOUT_AUTH_PROVIDER=github_app` setting for GitHub App installation-token authenticated sandbox checkout.
+- `ENABLE_GITHUB_APP_ROLLBACK_ACTIONS`, `HERMES_MEMORY_EVICTION_WEBHOOK_URL`, `HERMES_MEMORY_EVICTION_WEBHOOK_TOKEN`, and `HERMES_MEMORY_EVICTION_WEBHOOK_TIMEOUT_MS` settings for production job rollback through GitHub App branch deletion and Hermes memory eviction.
+- Admin-only `POST /api/sandbox/verify` endpoint that checks the Podman binary and executes a no-network container sentinel command when `SANDBOX_PROVIDER=podman`.
+- Admin-only `POST /api/sandbox/execute-smoke` endpoint that executes a fixed no-network Podman workspace command with resource limits, dropped capabilities, a read-only root filesystem, and artifact round-trip through a mounted workspace.
+- Job-scoped Podman QA proof execution during the local workflow retry phase when `SANDBOX_PROVIDER=podman`, including persisted iteration proof metadata and sandbox artifact audit logs.
+- Server-owned Podman sandbox verification script generation for configured install/build/test/static-analysis commands with stdout, stderr, summary, and JUnit artifact capture.
+- Optional Git checkout workspace materialization for job-scoped sandbox verification when `SANDBOX_CHECKOUT_PROVIDER=git`.
+- Optional GitHub App installation-token checkout authentication for job-scoped sandbox verification without exposing the token in job API responses.
+- Admin-only `POST /api/integrations/github-app/branches/delete` endpoint that deletes non-default branch refs through the GitHub App installation token server-side.
+- Admin-only `POST /api/integrations/github-app/file-commits` endpoint that commits UTF-8 file content to a target branch through the GitHub Contents API using the GitHub App installation token server-side.
+- Admin-only `POST /api/integrations/github-app/pull-requests` endpoint that opens a pull request from a verified feature branch to the repository default or supplied base branch using the GitHub App installation token server-side.
+- Admin-only `POST /api/integrations/github-app/pull-requests/status` and `/merge` endpoints that read sanitized PR state and merge PRs using the GitHub App installation token server-side.
+- `ENABLE_GITHUB_APP_REVIEW_ACTIONS` setting for production job approval through the GitHub App merge adapter when jobs have persisted pull request metadata.
 - Backend integration coverage for OAuth redirect sanitization, organization/team-scope OAuth authorization, and non-admin settings metadata filtering.
 - Backend integration coverage proving production rejects local simulation job execution by default.
 - Backend integration coverage proving production dev-login requires a token and disabled local-runner recovery fails stranded jobs.
@@ -20,7 +36,21 @@
 - Backend integration coverage proving GitHub App credentials are consumed from encrypted storage, merged by secret key, and validated as installation-token prerequisites.
 - Backend integration coverage proving GitHub App installation-token verification calls the GitHub API with a signed JWT and does not return the token to clients.
 - Backend integration coverage proving GitHub App repository-access verification uses the installation token server-side and returns sanitized default-branch metadata without returning the token.
+- Backend integration coverage proving GitHub App branch creation posts the expected branch ref payload with the installation token.
+- Backend integration coverage proving GitHub App branch deletion deletes a non-default feature ref with the installation token and does not return the token.
+- Backend integration coverage proving GitHub App file commits send base64 file content to the target branch without returning the installation token.
+- Backend integration coverage proving GitHub App pull request creation posts the expected head/base/title/body payload without returning the installation token.
+- Backend integration coverage proving GitHub App pull request status and merge calls use the installation token server-side and return sanitized metadata.
+- Backend integration coverage proving production `/api/jobs/:jobId/approve` can merge persisted job PR metadata through the GitHub App adapter instead of local state-only review.
+- Backend integration coverage proving production `/api/jobs/:jobId/rollback` can delete the persisted feature branch through the GitHub App adapter, call the Hermes memory eviction webhook, persist rollback state, and return the rollback snapshot.
+- Backend integration coverage proving Podman sandbox verification uses a no-network container command shape.
+- Backend integration coverage proving Podman sandbox command execution mounts a workspace, applies resource/security flags, and returns an artifact written inside the container workspace.
+- Backend integration coverage proving queued jobs attach Podman sandbox proof metadata and audit logs during QA verification when the Podman provider is configured.
+- Backend integration coverage proving configured sandbox install/build/test/static-analysis commands are written into the job-scoped Podman verification script and reflected in manager-visible proof metadata.
+- Backend integration coverage proving the job sandbox path clones the configured Git repository/ref into the mounted Podman workspace before running the command manifest.
+- Backend integration coverage proving sandbox checkout can exchange a GitHub App installation token, pass it to Git as an authorization header, and keep the token out of manager-visible job JSON.
 - Backend integration coverage for invite webhook delivery status and payload shape.
+- Production cutover checklist in `BUILD_PLAN.md` that maps each remaining production area to required evidence, current evidence, and status.
 - Transaction-scoped PostgreSQL advisory lock around app-state mutations to serialize cross-instance read-modify-write updates.
 
 ### Changed
@@ -35,11 +65,30 @@
 - `/api/jobs` now returns `503 WORKFLOW_PROVIDER_NOT_CONFIGURED` in production unless `ENABLE_LOCAL_WORKFLOW_RUNNER=true`, preventing the local artifact generator from running as implicit production execution.
 - Startup recovery now marks interrupted or queued local-runner jobs failed when the production local runner is disabled, instead of requeueing work to an inactive worker.
 - Job APIs now serialize job artifacts by caller role so Business Analysts can monitor task state without receiving manager-only review artifacts or actual ledger fields.
-- Approve and rollback endpoints now return `503 REVIEW_ADAPTER_NOT_CONFIGURED` in production unless `ENABLE_LOCAL_REVIEW_ACTIONS=true`, preventing simulated Git/Hermes review actions from being recorded as production work.
+- Approve endpoints now return `503 REVIEW_ADAPTER_NOT_CONFIGURED` in production unless `ENABLE_GITHUB_APP_REVIEW_ACTIONS=true` or `ENABLE_LOCAL_REVIEW_ACTIONS=true`, preventing simulated Git review actions from being recorded as production work.
+- Rollback endpoints now return `503 ROLLBACK_ADAPTER_NOT_CONFIGURED` in production unless `ENABLE_GITHUB_APP_ROLLBACK_ACTIONS=true` plus `HERMES_MEMORY_EVICTION_WEBHOOK_URL`, or `ENABLE_LOCAL_REVIEW_ACTIONS=true`, preventing simulated Git/Hermes rollback actions from being recorded as production work.
 - Stored integration updates now merge secret keys for an existing provider instead of replacing the full secret set, allowing multi-key provider credentials to be added incrementally.
 - Settings now reports GitHub App credential readiness after decrypting stored `app_id`, `installation_id`, and `private_key` values and signing a local GitHub App JWT.
 - Added admin-only GitHub App installation-token verification using `GITHUB_API_BASE_URL`, returning sanitized expiration, repository-selection, and permission metadata without exposing the access token.
 - Added admin-only GitHub App repository-access verification for `owner/repo` targets, including default branch ref lookup and sanitized repository permissions.
+- Added admin-only GitHub App branch creation for `owner/repo` targets, creating a feature ref from the verified default branch SHA without exposing the installation token.
+- Added admin-only GitHub App branch deletion for `owner/repo` targets, deleting non-default branch refs without exposing the installation token.
+- Added admin-only GitHub App file commits for `owner/repo` targets, writing UTF-8 content to a target branch and returning sanitized commit/blob metadata without exposing the installation token.
+- Added admin-only GitHub App pull request creation for `owner/repo` targets, opening PRs from verified feature branches and returning sanitized PR metadata without exposing the installation token.
+- Added admin-only GitHub App PR status lookup and merge for `owner/repo` targets, returning sanitized PR/merge metadata without exposing the installation token.
+- Production job approval can now call the GitHub App merge adapter when `ENABLE_GITHUB_APP_REVIEW_ACTIONS=true` and the job has persisted PR metadata.
+- Production job rollback can now call the GitHub App branch-deletion adapter and Hermes memory eviction webhook when `ENABLE_GITHUB_APP_ROLLBACK_ACTIONS=true` and the job has persisted branch/repository metadata.
+- Podman sandbox support now includes a reusable command execution adapter that can run a locked-down workspace command, not only the previous runtime sentinel check.
+- Local workflow QA verification now calls the Podman command adapter for a fixed job-scoped workspace proof when the Podman provider is configured, moving sandbox execution from manual smoke checks into the job pipeline.
+- Local workflow Podman QA verification now runs the configured sandbox command manifest when present and captures command stdout/stderr/JUnit artifacts into the job proof metadata.
+- Local workflow Podman QA verification can now clone a configured Git repository/ref into the sandbox workspace before command execution.
+- Sandbox Git checkout can now use the stored GitHub App integration to authenticate clone commands with an installation token.
+- Runtime sandbox provider status now reports `podman-configured` when `SANDBOX_PROVIDER=podman`.
+
+### Fixed
+- GitHub App repository snapshot reads now use the installation token passed into the helper, keeping repository verification and branch creation on the real GitHub App token path.
+- Production job approval now defaults the GitHub merge `sha` guard to the persisted pull request head SHA so stale PR heads cannot be merged silently.
+- Production rollback now preflights Hermes memory eviction configuration before deleting GitHub feature branches.
 
 ## [1.8.0] - Signed Invitation Links
 

@@ -2,6 +2,8 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -57,6 +59,7 @@ type TerminalStatus =
   | "PR_DRAFT"
   | "COMPLETED"
   | "ROLLED_BACK";
+type SandboxProviderKind = "local" | "podman" | "kubernetes";
 
 interface AppUser {
   id: string;
@@ -135,6 +138,22 @@ interface CostEstimate {
   isComplex: boolean;
 }
 
+interface PullRequestRecord {
+  number: number;
+  url: string;
+  state: string;
+  draft: boolean;
+  title: string;
+  body: string;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  baseSha?: string | null;
+  merged?: boolean;
+  mergeSha?: string;
+  mergedAt?: string;
+}
+
 interface StoredJob {
   id: string;
   executionId: string;
@@ -163,6 +182,7 @@ interface StoredJob {
   estimate: CostEstimate;
   logs: string[];
   result?: ReturnType<typeof generateOfflineSimulation>;
+  pullRequest?: PullRequestRecord;
   rollbackSnapshot?: {
     branchDeleted: boolean;
     jobStateReverted: boolean;
@@ -199,19 +219,47 @@ const devLoginEnabled = !isProduction || process.env.ENABLE_DEV_LOGIN === "true"
 const legacyDispatchEnabled = !isProduction || process.env.ENABLE_LEGACY_DISPATCH === "true";
 const localWorkflowRunnerEnabled = !isProduction || process.env.ENABLE_LOCAL_WORKFLOW_RUNNER === "true";
 const localReviewActionsEnabled = !isProduction || process.env.ENABLE_LOCAL_REVIEW_ACTIONS === "true";
+const githubAppReviewActionsEnabled = process.env.ENABLE_GITHUB_APP_REVIEW_ACTIONS === "true";
+const githubAppRollbackActionsEnabled = process.env.ENABLE_GITHUB_APP_ROLLBACK_ACTIONS === "true";
 const devLoginToken = process.env.DEV_LOGIN_TOKEN || "";
 const localWorkerPollMs = Number(process.env.LOCAL_WORKER_POLL_MS || 1000);
+const sandboxProviderKind = normalizeSandboxProvider(process.env.SANDBOX_PROVIDER);
+const podmanBin = process.env.PODMAN_BIN || "podman";
+const podmanImage = process.env.PODMAN_IMAGE || "docker.io/library/node:22-alpine";
+const podmanMemory = process.env.PODMAN_MEMORY || "512m";
+const podmanCpus = process.env.PODMAN_CPUS || "1";
+const sandboxTimeoutMs = Number(process.env.SANDBOX_TIMEOUT_MS || 30000);
+const sandboxInstallCommand = process.env.SANDBOX_INSTALL_COMMAND || "";
+const sandboxBuildCommand = process.env.SANDBOX_BUILD_COMMAND || "";
+const sandboxTestCommand = process.env.SANDBOX_TEST_COMMAND || "";
+const sandboxStaticAnalysisCommand = process.env.SANDBOX_STATIC_ANALYSIS_COMMAND || "";
+const sandboxCheckoutProvider = (process.env.SANDBOX_CHECKOUT_PROVIDER || "none").trim().toLowerCase();
+const sandboxCheckoutAuthProvider = (process.env.SANDBOX_CHECKOUT_AUTH_PROVIDER || "none").trim().toLowerCase();
+const sandboxRepositoryUrl = process.env.SANDBOX_REPOSITORY_URL || "";
+const sandboxCheckoutRef = process.env.SANDBOX_CHECKOUT_REF || "";
+const gitBin = process.env.GIT_BIN || "git";
+const gitCloneTimeoutMs = Number(process.env.GIT_CLONE_TIMEOUT_MS || 30000);
 const integrationEncryptionSecret =
   process.env.INTEGRATION_ENCRYPTION_KEY ||
   `${sessionSecret}:integration-secret-development-fallback`;
 const inviteTokenTtlHours = Number(process.env.INVITE_TOKEN_TTL_HOURS || 168);
 const inviteEmailWebhookTimeoutMs = Number(process.env.INVITE_EMAIL_WEBHOOK_TIMEOUT_MS || 5000);
 const githubApiBaseUrl = (process.env.GITHUB_API_BASE_URL || "https://api.github.com").replace(/\/+$/, "");
+const hermesMemoryEvictionWebhookUrl = process.env.HERMES_MEMORY_EVICTION_WEBHOOK_URL || "";
+const hermesMemoryEvictionWebhookTimeoutMs = Number(process.env.HERMES_MEMORY_EVICTION_WEBHOOK_TIMEOUT_MS || 5000);
+const execFileAsync = promisify(execFile);
 
 validateProductionSecrets();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function normalizeSandboxProvider(value: string | undefined): SandboxProviderKind {
+  const normalized = (value || "").trim().toLowerCase();
+  if (normalized === "podman" || normalized === "kubernetes" || normalized === "local") return normalized;
+  if (process.env.KUBERNETES_SERVICE_HOST) return "kubernetes";
+  return "local";
 }
 
 function validateProductionSecret(name: string, value: string | undefined, disallowedValues: string[]) {
@@ -243,8 +291,9 @@ function workflowProviderStatus() {
 }
 
 function sandboxProviderStatus() {
+  if (sandboxProviderKind === "podman") return "podman-configured";
+  if (sandboxProviderKind === "kubernetes") return "kubernetes-configured-no-sandbox-adapter";
   if (localWorkflowRunnerEnabled) return "local-provider";
-  if (process.env.KUBERNETES_SERVICE_HOST) return "kubernetes-configured-no-sandbox-adapter";
   return "disabled-production-local-provider";
 }
 
@@ -253,11 +302,253 @@ function workflowExecutionAvailable() {
 }
 
 function reviewActionStatus() {
+  if (githubAppReviewActionsEnabled) return "github-app-adapter";
   return localReviewActionsEnabled ? "local-state-only" : "disabled-production-no-review-adapter";
 }
 
 function reviewActionsAvailable() {
-  return localReviewActionsEnabled;
+  return localReviewActionsEnabled || githubAppReviewActionsEnabled;
+}
+
+function rollbackActionStatus() {
+  if (githubAppRollbackActionsEnabled) {
+    return hermesMemoryEvictionWebhookUrl ? "github-app-hermes-adapter" : "github-app-rollback-missing-hermes-memory";
+  }
+  return localReviewActionsEnabled ? "local-state-only" : "disabled-production-no-rollback-adapter";
+}
+
+function rollbackActionsAvailable() {
+  return localReviewActionsEnabled || (githubAppRollbackActionsEnabled && Boolean(hermesMemoryEvictionWebhookUrl));
+}
+
+function sandboxCommandManifest() {
+  return [
+    { name: "install", command: sandboxInstallCommand },
+    { name: "build", command: sandboxBuildCommand },
+    { name: "test", command: sandboxTestCommand },
+    { name: "static-analysis", command: sandboxStaticAnalysisCommand },
+  ]
+    .map((step) => ({ ...step, command: step.command.trim() }))
+    .filter((step) => step.command.length > 0);
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+async function runPodman(args: string[]) {
+  const result = await execFileAsync(podmanBin, args, {
+    timeout: sandboxTimeoutMs,
+    maxBuffer: 1024 * 1024,
+  });
+  return {
+    stdout: String(result.stdout).trim(),
+    stderr: String(result.stderr).trim(),
+  };
+}
+
+async function runGit(args: string[]) {
+  const result = await execFileAsync(gitBin, args, {
+    timeout: gitCloneTimeoutMs,
+    maxBuffer: 1024 * 1024,
+  });
+  return {
+    stdout: String(result.stdout).trim(),
+    stderr: String(result.stderr).trim(),
+  };
+}
+
+async function executePodmanSandboxCommand(params: { workspaceDir: string; command: string }) {
+  if (sandboxProviderKind === "kubernetes") {
+    return {
+      ok: false as const,
+      statusCode: 501,
+      code: "KUBERNETES_SANDBOX_ADAPTER_NOT_IMPLEMENTED",
+      error: "Kubernetes sandbox execution is configured, but the Kubernetes sandbox adapter is not implemented yet.",
+    };
+  }
+
+  if (sandboxProviderKind !== "podman") {
+    return {
+      ok: false as const,
+      statusCode: 409,
+      code: "SANDBOX_PROVIDER_NOT_CONFIGURED",
+      error: "Set SANDBOX_PROVIDER=podman to execute isolated local container commands.",
+    };
+  }
+
+  const workspaceDir = path.resolve(params.workspaceDir);
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  try {
+    const execution = await runPodman([
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--pull",
+      "never",
+      "--memory",
+      podmanMemory,
+      "--cpus",
+      podmanCpus,
+      "--pids-limit",
+      "256",
+      "--cap-drop",
+      "all",
+      "--security-opt",
+      "no-new-privileges",
+      "--read-only",
+      "--tmpfs",
+      "/tmp:rw,noexec,nosuid,size=64m",
+      "-v",
+      `${workspaceDir}:/workspace:rw,Z`,
+      "--workdir",
+      "/workspace",
+      podmanImage,
+      "sh",
+      "-lc",
+      params.command,
+    ]);
+
+    return {
+      ok: true as const,
+      provider: "podman" as const,
+      status: "executed" as const,
+      image: podmanImage,
+      network: "none" as const,
+      memory: podmanMemory,
+      cpus: podmanCpus,
+      timeoutMs: sandboxTimeoutMs,
+      stdout: execution.stdout,
+      stderr: execution.stderr,
+    };
+  } catch (error) {
+    return {
+      ok: false as const,
+      statusCode: 503,
+      code: "SANDBOX_EXECUTION_FAILED",
+      error: commandFailureMessage(error, "Podman sandbox execution failed."),
+    };
+  }
+}
+
+function commandFailureMessage(error: unknown, missingBinaryMessage: string) {
+  const details = error as {
+    code?: unknown;
+    killed?: boolean;
+    stderr?: unknown;
+    stdout?: unknown;
+    message?: string;
+  };
+
+  if (details?.code === "ENOENT") return missingBinaryMessage;
+
+  const timeout = details?.killed ? `Command timed out after ${sandboxTimeoutMs}ms.` : "";
+  const stderr = details?.stderr ? String(details.stderr).trim() : "";
+  const stdout = details?.stdout ? String(details.stdout).trim() : "";
+  const message = error instanceof Error ? error.message : details?.message || "Sandbox command failed.";
+  return redactSensitiveText([timeout, stderr || stdout || message].filter(Boolean).join(" "));
+}
+
+function sandboxGitRepositoryUrl(job: StoredJob) {
+  if (sandboxRepositoryUrl.trim()) return sandboxRepositoryUrl.trim();
+  if (/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(job.targetRepository)) {
+    return `https://github.com/${job.targetRepository}.git`;
+  }
+  return job.targetRepository;
+}
+
+function redactSensitiveText(value: string) {
+  return value
+    .replace(/Authorization:\s*Bearer\s+[^\s"']+/gi, "Authorization: Bearer [REDACTED]")
+    .replace(/Bearer\s+gh[opsu]_[A-Za-z0-9_]+/g, "Bearer [REDACTED]")
+    .replace(/gh[opsu]_[A-Za-z0-9_]+/g, "[REDACTED_GITHUB_TOKEN]");
+}
+
+async function verifySandboxRuntime() {
+  if (sandboxProviderKind === "kubernetes") {
+    return {
+      ok: false as const,
+      statusCode: 501,
+      code: "KUBERNETES_SANDBOX_ADAPTER_NOT_IMPLEMENTED",
+      error: "Kubernetes sandbox execution is configured, but the Kubernetes sandbox adapter is not implemented yet.",
+    };
+  }
+
+  if (sandboxProviderKind !== "podman") {
+    return {
+      ok: false as const,
+      statusCode: 409,
+      code: "SANDBOX_PROVIDER_NOT_CONFIGURED",
+      error: "Set SANDBOX_PROVIDER=podman to verify isolated local container execution.",
+    };
+  }
+
+  let version: { stdout: string; stderr: string };
+  try {
+    version = await runPodman(["--version"]);
+  } catch (error) {
+    return {
+      ok: false as const,
+      statusCode: 503,
+      code: "PODMAN_UNAVAILABLE",
+      error: commandFailureMessage(error, `Podman binary "${podmanBin}" was not found.`),
+    };
+  }
+
+  let sandbox: { stdout: string; stderr: string };
+  try {
+    sandbox = await runPodman([
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--pull",
+      "never",
+      "--memory",
+      podmanMemory,
+      "--cpus",
+      podmanCpus,
+      podmanImage,
+      "sh",
+      "-lc",
+      "printf sandbox-ready",
+    ]);
+  } catch (error) {
+    return {
+      ok: false as const,
+      statusCode: 503,
+      code: "SANDBOX_VERIFY_FAILED",
+      error: commandFailureMessage(error, "Podman sandbox verification failed."),
+      version: version.stdout,
+    };
+  }
+
+  if (sandbox.stdout !== "sandbox-ready") {
+    return {
+      ok: false as const,
+      statusCode: 502,
+      code: "SANDBOX_VERIFY_FAILED",
+      error: "Podman sandbox did not return the expected verification sentinel.",
+      version: version.stdout,
+      stdout: sandbox.stdout,
+      stderr: sandbox.stderr,
+    };
+  }
+
+  return {
+    ok: true as const,
+    provider: "podman" as const,
+    status: "ready" as const,
+    version: version.stdout,
+    image: podmanImage,
+    network: "none" as const,
+    memory: podmanMemory,
+    cpus: podmanCpus,
+    timeoutMs: sandboxTimeoutMs,
+    stdout: sandbox.stdout,
+  };
 }
 
 function devLoginAuthorized(req: Request) {
@@ -1014,9 +1305,9 @@ async function readGitHubJson<T>(url: string, token: string) {
   return { response, body };
 }
 
-async function writeGitHubJson<T>(url: string, token: string, body: unknown) {
+async function sendGitHubJson<T>(method: "POST" | "PUT" | "PATCH" | "DELETE", url: string, token: string, body: unknown) {
   const response = await fetch(url, {
-    method: "POST",
+    method,
     headers: {
       Accept: "application/vnd.github+json",
       Authorization: `Bearer ${token}`,
@@ -1028,6 +1319,14 @@ async function writeGitHubJson<T>(url: string, token: string, body: unknown) {
   const text = await response.text();
   const responseBody = text ? JSON.parse(text) as T & { message?: string } : {} as T & { message?: string };
   return { response, body: responseBody };
+}
+
+async function writeGitHubJson<T>(url: string, token: string, body: unknown) {
+  return sendGitHubJson<T>("POST", url, token, body);
+}
+
+async function putGitHubJson<T>(url: string, token: string, body: unknown) {
+  return sendGitHubJson<T>("PUT", url, token, body);
 }
 
 async function readGitHubRepositorySnapshot(token: string, repositoryName: string) {
@@ -1046,7 +1345,7 @@ async function readGitHubRepositorySnapshot(token: string, repositoryName: strin
     default_branch?: string;
     private?: boolean;
     permissions?: Record<string, boolean>;
-  }>(repoUrl, tokenResult.token);
+  }>(repoUrl, token);
 
   if (!repoResult.response.ok || !repoResult.body.full_name || !repoResult.body.default_branch) {
     return {
@@ -1062,7 +1361,7 @@ async function readGitHubRepositorySnapshot(token: string, repositoryName: strin
       sha?: string;
       type?: string;
     };
-  }>(refUrl, tokenResult.token);
+  }>(refUrl, token);
 
   if (!refResult.response.ok || !refResult.body.object?.sha) {
     return {
@@ -1074,7 +1373,6 @@ async function readGitHubRepositorySnapshot(token: string, repositoryName: strin
 
   return {
     ok: true as const,
-    credentialStatus: tokenResult.status,
     repository: repoResult.body.full_name,
     defaultBranch: repoResult.body.default_branch,
     defaultBranchSha: refResult.body.object.sha,
@@ -1137,6 +1435,66 @@ function validateGitBranchName(branchName: unknown) {
   return branch;
 }
 
+function validateRepositoryPath(value: unknown) {
+  const filePath = typeof value === "string" ? value.trim() : "";
+  if (!filePath || filePath.length > 240) return null;
+  if (
+    filePath.startsWith("/") ||
+    filePath.endsWith("/") ||
+    filePath.includes("\\") ||
+    filePath.includes("\0") ||
+    filePath.split("/").some((part) => !part || part === "." || part === ".." || part.endsWith(".lock"))
+  ) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(filePath)) return null;
+  return filePath;
+}
+
+function validateCommitMessage(value: unknown) {
+  const message = typeof value === "string" ? value.trim() : "";
+  if (!message || message.length > 200) return null;
+  return message;
+}
+
+function validateCommitContent(value: unknown) {
+  if (typeof value !== "string") return null;
+  if (Buffer.byteLength(value, "utf8") > 1024 * 1024) return null;
+  return value;
+}
+
+function validatePullRequestTitle(value: unknown) {
+  const title = typeof value === "string" ? value.trim() : "";
+  if (!title || title.length > 200) return null;
+  return title;
+}
+
+function validatePullRequestBody(value: unknown) {
+  if (value === undefined || value === null) return "";
+  if (typeof value !== "string") return null;
+  if (Buffer.byteLength(value, "utf8") > 65536) return null;
+  return value.trim();
+}
+
+function validatePullRequestNumber(value: unknown) {
+  const numberValue = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(numberValue) || numberValue <= 0) return null;
+  return numberValue;
+}
+
+function validateMergeMethod(value: unknown) {
+  const method = typeof value === "string" ? value.trim().toLowerCase() : "merge";
+  if (method === "merge" || method === "squash" || method === "rebase") return method;
+  return null;
+}
+
+function validateGitSha(value: unknown) {
+  const sha = typeof value === "string" ? value.trim() : "";
+  if (!sha) return null;
+  if (!/^[a-f0-9]{40}$/i.test(sha)) return null;
+  return sha;
+}
+
 async function createGitHubAppBranch(integrations: IntegrationConfig[], repositoryName: string, branchName: unknown) {
   const branch = validateGitBranchName(branchName);
   if (!branch) {
@@ -1190,6 +1548,517 @@ async function createGitHubAppBranch(integrations: IntegrationConfig[], reposito
     ref: createRef.body.ref,
     branchSha: createRef.body.object.sha,
     branchObjectType: createRef.body.object.type || null,
+  };
+}
+
+async function deleteGitHubAppBranch(integrations: IntegrationConfig[], repositoryName: string, branchName: unknown) {
+  const branch = validateGitBranchName(branchName);
+  if (!branch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid branchName is required.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const snapshot = await readGitHubRepositorySnapshot(tokenResult.token, repositoryName);
+  if (snapshot.ok === false) return snapshot;
+  if (branch === snapshot.defaultBranch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Refusing to delete the repository default branch.",
+    };
+  }
+
+  const branchRefUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repo)}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const branchRef = await readGitHubJson<{
+    ref?: string;
+    object?: {
+      sha?: string;
+      type?: string;
+    };
+  }>(branchRefUrl, tokenResult.token);
+
+  if (!branchRef.response.ok || !branchRef.body.object?.sha) {
+    return {
+      ok: false as const,
+      statusCode: branchRef.response.status === 404 ? 404 : 502,
+      error: branchRef.body.message || "GitHub App branch ref lookup failed.",
+    };
+  }
+
+  const deleteRefUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repo)}/git/refs/heads/${encodeURIComponent(branch)}`;
+  const deleteRef = await sendGitHubJson<Record<string, never>>("DELETE", deleteRefUrl, tokenResult.token, {});
+
+  if (!deleteRef.response.ok && deleteRef.response.status !== 204) {
+    return {
+      ok: false as const,
+      statusCode: deleteRef.response.status === 404 ? 404 : 502,
+      error: deleteRef.body.message || "GitHub App branch deletion failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: snapshot.repository,
+    defaultBranch: snapshot.defaultBranch,
+    branchName: branch,
+    ref: branchRef.body.ref || `refs/heads/${branch}`,
+    branchSha: branchRef.body.object.sha,
+    branchObjectType: branchRef.body.object.type || null,
+    deleted: true as const,
+  };
+}
+
+async function readGitHubAppPullRequest(integrations: IntegrationConfig[], repositoryName: string, pullRequestNumberValue: unknown) {
+  const repository = parseGitHubRepository(repositoryName);
+  if (!repository) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Repository must be formatted as owner/repo.",
+    };
+  }
+
+  const pullRequestNumber = validatePullRequestNumber(pullRequestNumberValue);
+  if (!pullRequestNumber) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid pullRequestNumber is required.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const pullRequestUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${pullRequestNumber}`;
+  const pullRequest = await readGitHubJson<{
+    number?: number;
+    html_url?: string;
+    state?: string;
+    draft?: boolean;
+    merged?: boolean;
+    mergeable?: boolean | null;
+    mergeable_state?: string;
+    title?: string;
+    body?: string | null;
+    head?: {
+      ref?: string;
+      sha?: string;
+    };
+    base?: {
+      ref?: string;
+      sha?: string;
+    };
+    user?: {
+      login?: string;
+    };
+  }>(pullRequestUrl, tokenResult.token);
+
+  if (!pullRequest.response.ok || !pullRequest.body.number || !pullRequest.body.html_url) {
+    return {
+      ok: false as const,
+      statusCode: pullRequest.response.status === 404 ? 404 : 502,
+      error: pullRequest.body.message || "GitHub App pull request status lookup failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: repository.fullName,
+    pullRequestNumber: pullRequest.body.number,
+    pullRequestUrl: pullRequest.body.html_url,
+    pullRequestState: pullRequest.body.state || "unknown",
+    draft: Boolean(pullRequest.body.draft),
+    merged: Boolean(pullRequest.body.merged),
+    mergeable: pullRequest.body.mergeable ?? null,
+    mergeableState: pullRequest.body.mergeable_state || null,
+    title: pullRequest.body.title || "",
+    body: pullRequest.body.body || "",
+    headRef: pullRequest.body.head?.ref || null,
+    headSha: pullRequest.body.head?.sha || null,
+    baseRef: pullRequest.body.base?.ref || null,
+    baseSha: pullRequest.body.base?.sha || null,
+    authorLogin: pullRequest.body.user?.login || null,
+  };
+}
+
+async function mergeGitHubAppPullRequest(
+  integrations: IntegrationConfig[],
+  repositoryName: string,
+  pullRequestNumberValue: unknown,
+  mergeMethodValue: unknown,
+  commitTitleValue: unknown,
+  commitMessageValue: unknown,
+  expectedHeadShaValue: unknown,
+) {
+  const repository = parseGitHubRepository(repositoryName);
+  if (!repository) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Repository must be formatted as owner/repo.",
+    };
+  }
+
+  const pullRequestNumber = validatePullRequestNumber(pullRequestNumberValue);
+  if (!pullRequestNumber) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid pullRequestNumber is required.",
+    };
+  }
+
+  const mergeMethod = validateMergeMethod(mergeMethodValue);
+  if (!mergeMethod) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "mergeMethod must be merge, squash, or rebase.",
+    };
+  }
+
+  const commitTitle = commitTitleValue === undefined ? undefined : validateCommitMessage(commitTitleValue);
+  if (commitTitleValue !== undefined && !commitTitle) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "commitTitle must be a non-empty string up to 200 characters when provided.",
+    };
+  }
+
+  const commitMessage = commitMessageValue === undefined ? undefined : validatePullRequestBody(commitMessageValue);
+  if (commitMessage === null) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "commitMessage must be a UTF-8 string up to 64 KiB when provided.",
+    };
+  }
+
+  const expectedHeadSha = expectedHeadShaValue === undefined ? undefined : validateGitSha(expectedHeadShaValue);
+  if (expectedHeadShaValue !== undefined && !expectedHeadSha) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "expectedHeadSha must be a 40-character Git SHA when provided.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const mergeUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/pulls/${pullRequestNumber}/merge`;
+  const merge = await putGitHubJson<{
+    sha?: string;
+    merged?: boolean;
+    message?: string;
+  }>(mergeUrl, tokenResult.token, {
+    merge_method: mergeMethod,
+    commit_title: commitTitle,
+    commit_message: commitMessage,
+    sha: expectedHeadSha,
+  });
+
+  if (!merge.response.ok || !merge.body.merged || !merge.body.sha) {
+    return {
+      ok: false as const,
+      statusCode: merge.response.status === 405 || merge.response.status === 409 ? 409 : 502,
+      error: merge.body.message || "GitHub App pull request merge failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: repository.fullName,
+    pullRequestNumber,
+    merged: true as const,
+    mergeSha: merge.body.sha,
+    mergeMessage: merge.body.message || "Pull request merged.",
+    mergeMethod,
+  };
+}
+
+async function createGitHubAppPullRequest(
+  integrations: IntegrationConfig[],
+  repositoryName: string,
+  branchName: unknown,
+  titleValue: unknown,
+  bodyValue: unknown,
+  baseBranchValue: unknown,
+  draftValue: unknown,
+) {
+  const branch = validateGitBranchName(branchName);
+  if (!branch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid branchName is required.",
+    };
+  }
+
+  const title = validatePullRequestTitle(titleValue);
+  if (!title) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A pull request title up to 200 characters is required.",
+    };
+  }
+
+  const body = validatePullRequestBody(bodyValue);
+  if (body === null) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Pull request body must be a UTF-8 string up to 64 KiB.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const snapshot = await readGitHubRepositorySnapshot(tokenResult.token, repositoryName);
+  if (snapshot.ok === false) return snapshot;
+
+  const baseBranch = baseBranchValue ? validateGitBranchName(baseBranchValue) : snapshot.defaultBranch;
+  if (!baseBranch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid baseBranch is required when provided.",
+    };
+  }
+  if (baseBranch === branch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Pull request head branch and base branch must be different.",
+    };
+  }
+
+  const branchRefUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repo)}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const branchRef = await readGitHubJson<{
+    ref?: string;
+    object?: {
+      sha?: string;
+      type?: string;
+    };
+  }>(branchRefUrl, tokenResult.token);
+
+  if (!branchRef.response.ok || !branchRef.body.object?.sha) {
+    return {
+      ok: false as const,
+      statusCode: 502,
+      error: branchRef.body.message || "GitHub App pull request branch verification failed.",
+    };
+  }
+
+  const pullRequestUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(snapshot.owner)}/${encodeURIComponent(snapshot.repo)}/pulls`;
+  const pullRequest = await writeGitHubJson<{
+    number?: number;
+    html_url?: string;
+    state?: string;
+    draft?: boolean;
+    title?: string;
+    body?: string | null;
+    head?: {
+      ref?: string;
+      sha?: string;
+    };
+    base?: {
+      ref?: string;
+      sha?: string;
+    };
+  }>(pullRequestUrl, tokenResult.token, {
+    title,
+    head: branch,
+    base: baseBranch,
+    body,
+    draft: draftValue === true,
+  });
+
+  if (!pullRequest.response.ok || !pullRequest.body.number || !pullRequest.body.html_url) {
+    return {
+      ok: false as const,
+      statusCode: pullRequest.response.status === 422 ? 409 : 502,
+      error: pullRequest.body.message || "GitHub App pull request creation failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    credentialStatus: tokenResult.status,
+    repository: snapshot.repository,
+    branchName: branch,
+    branchSha: branchRef.body.object.sha,
+    branchObjectType: branchRef.body.object.type || null,
+    baseBranch,
+    baseSha: pullRequest.body.base?.sha || null,
+    defaultBranch: snapshot.defaultBranch,
+    pullRequestNumber: pullRequest.body.number,
+    pullRequestUrl: pullRequest.body.html_url,
+    pullRequestState: pullRequest.body.state || "open",
+    draft: Boolean(pullRequest.body.draft),
+    title: pullRequest.body.title || title,
+    body: pullRequest.body.body || body,
+    headRef: pullRequest.body.head?.ref || branch,
+    headSha: pullRequest.body.head?.sha || branchRef.body.object.sha,
+  };
+}
+
+async function commitGitHubAppFile(
+  integrations: IntegrationConfig[],
+  repositoryName: string,
+  branchName: unknown,
+  filePathValue: unknown,
+  contentValue: unknown,
+  commitMessageValue: unknown,
+) {
+  const repository = parseGitHubRepository(repositoryName);
+  if (!repository) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "Repository must be formatted as owner/repo.",
+    };
+  }
+
+  const branch = validateGitBranchName(branchName);
+  if (!branch) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid branchName is required.",
+    };
+  }
+
+  const filePath = validateRepositoryPath(filePathValue);
+  if (!filePath) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A valid repository filePath is required.",
+    };
+  }
+
+  const content = validateCommitContent(contentValue);
+  if (content === null) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A UTF-8 string content value up to 1 MiB is required.",
+    };
+  }
+
+  const commitMessage = validateCommitMessage(commitMessageValue);
+  if (!commitMessage) {
+    return {
+      ok: false as const,
+      statusCode: 400,
+      error: "A commitMessage up to 200 characters is required.",
+    };
+  }
+
+  const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+  if (tokenResult.ok === false) {
+    return {
+      ok: false as const,
+      statusCode: tokenResult.statusCode,
+      error: tokenResult.error,
+    };
+  }
+
+  const branchRefUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/git/ref/heads/${encodeURIComponent(branch)}`;
+  const branchRef = await readGitHubJson<{
+    ref?: string;
+    object?: {
+      sha?: string;
+      type?: string;
+    };
+  }>(branchRefUrl, tokenResult.token);
+
+  if (!branchRef.response.ok || !branchRef.body.object?.sha) {
+    return {
+      ok: false as const,
+      statusCode: 502,
+      error: branchRef.body.message || "GitHub App branch ref verification failed.",
+    };
+  }
+
+  const contentUrl = `${githubApiBaseUrl}/repos/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.repo)}/contents/${filePath.split("/").map(encodeURIComponent).join("/")}`;
+  const commit = await putGitHubJson<{
+    content?: {
+      path?: string;
+      sha?: string;
+      html_url?: string;
+    };
+    commit?: {
+      sha?: string;
+      html_url?: string;
+      message?: string;
+    };
+  }>(contentUrl, tokenResult.token, {
+    message: commitMessage,
+    content: Buffer.from(content, "utf8").toString("base64"),
+    branch,
+  });
+
+  if (!commit.response.ok || !commit.body.commit?.sha || !commit.body.content?.sha) {
+    return {
+      ok: false as const,
+      statusCode: commit.response.status === 409 ? 409 : 502,
+      error: commit.body.message || "GitHub App file commit failed.",
+    };
+  }
+
+  return {
+    ok: true as const,
+    statusCode: commit.response.status === 200 ? 200 : 201,
+    credentialStatus: tokenResult.status,
+    repository: repository.fullName,
+    branchName: branch,
+    branchSha: branchRef.body.object.sha,
+    branchObjectType: branchRef.body.object.type || null,
+    path: commit.body.content.path || filePath,
+    contentSha: commit.body.content.sha,
+    contentUrl: commit.body.content.html_url || null,
+    commitSha: commit.body.commit.sha,
+    commitUrl: commit.body.commit.html_url || null,
+    commitMessage: commit.body.commit.message || commitMessage,
   };
 }
 
@@ -1330,6 +2199,8 @@ function jobToClient(job: StoredJob, role: UserRole) {
     assignedTo: job.assignedTo,
     estimate: job.estimate,
     createdByUserId: job.createdByUserId,
+    pullRequest: job.pullRequest || null,
+    rollbackSnapshot: job.rollbackSnapshot || null,
     pipelineState: jobToPipelineState(job, role),
     result: jobResultForRole(job, role),
   };
@@ -1458,6 +2329,199 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function materializeSandboxWorkspace(
+  job: StoredJob,
+  result: ReturnType<typeof generateOfflineSimulation>,
+  workspaceRoot: string,
+  integrations: IntegrationConfig[],
+) {
+  if (sandboxCheckoutProvider !== "git") {
+    fs.mkdirSync(workspaceRoot, { recursive: true });
+    return {
+      workspaceDir: workspaceRoot,
+      checkout: null,
+    };
+  }
+
+  const repositoryUrl = sandboxGitRepositoryUrl(job);
+  const checkoutRef = (sandboxCheckoutRef || job.gitBranch || result.gitBranch).trim();
+  const authProvider = sandboxCheckoutAuthProvider === "github_app" ? "github_app" : "none";
+  if (!repositoryUrl || !checkoutRef) {
+    throw new Error("SANDBOX_CHECKOUT_PROVIDER=git requires a repository URL and checkout ref.");
+  }
+  if (sandboxCheckoutAuthProvider && authProvider === "none" && sandboxCheckoutAuthProvider !== "none") {
+    throw new Error("SANDBOX_CHECKOUT_AUTH_PROVIDER must be either none or github_app.");
+  }
+
+  const repoDir = path.join(workspaceRoot, "repo");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  const cloneArgs = ["clone", "--depth", "1", "--branch", checkoutRef, repositoryUrl, repoDir];
+  if (authProvider === "github_app") {
+    const tokenResult = await exchangeGitHubAppInstallationToken(integrations);
+    if (tokenResult.ok === false) {
+      throw new Error(`GitHub App sandbox checkout token exchange failed: ${tokenResult.error}`);
+    }
+    cloneArgs.unshift("-c", `http.extraHeader=Authorization: Bearer ${tokenResult.token}`);
+  }
+
+  try {
+    await runGit(cloneArgs);
+  } catch (error) {
+    throw new Error(`Sandbox git checkout failed: ${commandFailureMessage(error, `Git binary "${gitBin}" was not found.`)}`);
+  }
+
+  return {
+    workspaceDir: repoDir,
+    checkout: {
+      provider: "git",
+      authProvider,
+      repository: job.targetRepository,
+      ref: checkoutRef,
+      depth: 1,
+    },
+  };
+}
+
+async function runJobSandboxProof(
+  job: StoredJob,
+  result: ReturnType<typeof generateOfflineSimulation>,
+  iterationIndex: number,
+  integrations: IntegrationConfig[],
+) {
+  if (sandboxProviderKind !== "podman") return null;
+
+  fs.mkdirSync(dataDir, { recursive: true });
+  const workspaceRoot = fs.mkdtempSync(path.join(dataDir, `job-${job.id}-sandbox-`));
+  try {
+    const iteration = result.iterations[iterationIndex - 1];
+    if (!iteration) return null;
+    const materialized = await materializeSandboxWorkspace(job, result, workspaceRoot, integrations);
+    const workspaceDir = materialized.workspaceDir;
+
+    fs.writeFileSync(
+      path.join(workspaceDir, "input.json"),
+      JSON.stringify({
+        jobId: job.id,
+        executionId: job.executionId,
+        hermesSessionId: job.hermesSessionId,
+        taskName: result.taskName,
+        gitBranch: result.gitBranch,
+        iterationIndex,
+        expectedStatus: iteration.status,
+      }, null, 2),
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(workspaceDir, "axiom-sandbox-run.sh"),
+      sandboxVerificationScript(sandboxCommandManifest()),
+      { mode: 0o755 },
+    );
+
+    const execution = await executePodmanSandboxCommand({
+      workspaceDir,
+      command: "sh axiom-sandbox-run.sh",
+    });
+    if (execution.ok === false) {
+      throw new Error(`${execution.code}: ${execution.error}`);
+    }
+
+    const artifactPath = path.join(workspaceDir, "artifacts", "summary.txt");
+    const junitPath = path.join(workspaceDir, "artifacts", "junit.xml");
+    const stdoutPath = path.join(workspaceDir, "artifacts", "stdout.log");
+    const stderrPath = path.join(workspaceDir, "artifacts", "stderr.log");
+    const artifact = fs.existsSync(artifactPath) ? fs.readFileSync(artifactPath, "utf8").trim() : "";
+    const junitXml = fs.existsSync(junitPath) ? fs.readFileSync(junitPath, "utf8").trim() : "";
+    const stdoutArtifact = fs.existsSync(stdoutPath) ? fs.readFileSync(stdoutPath, "utf8").trim() : "";
+    const stderrArtifact = fs.existsSync(stderrPath) ? fs.readFileSync(stderrPath, "utf8").trim() : "";
+    const manifest = sandboxCommandManifest();
+
+    iteration.stdout = [
+      iteration.stdout,
+      "",
+      "[Axiom Sandbox Execution]",
+      execution.stdout,
+      stdoutArtifact ? `[Sandbox stdout artifact]\n${stdoutArtifact}` : "",
+      stderrArtifact ? `[Sandbox stderr artifact]\n${stderrArtifact}` : "",
+    ].filter(Boolean).join("\n");
+    (iteration as typeof iteration & { sandboxProof?: Record<string, unknown> }).sandboxProof = {
+      provider: execution.provider,
+      mode: manifest.length > 0 ? "configured-command-manifest" : "fixed-workspace-proof",
+      image: execution.image,
+      network: execution.network,
+      memory: execution.memory,
+      cpus: execution.cpus,
+      artifact,
+      checkout: materialized.checkout,
+      steps: manifest.map((step) => step.name),
+      stdoutCaptured: Boolean(stdoutArtifact),
+      stderrCaptured: Boolean(stderrArtifact),
+      junitXmlCaptured: Boolean(junitXml),
+      completedAt: nowIso(),
+    };
+
+    return {
+      provider: execution.provider,
+      image: execution.image,
+      network: execution.network,
+      memory: execution.memory,
+      cpus: execution.cpus,
+      artifact,
+      checkout: materialized.checkout,
+      mode: manifest.length > 0 ? "configured-command-manifest" : "fixed-workspace-proof",
+      steps: manifest.map((step) => step.name),
+      stdout: execution.stdout,
+    };
+  } finally {
+    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+  }
+}
+
+function sandboxVerificationScript(manifest: Array<{ name: string; command: string }>) {
+  const lines = [
+    "#!/bin/sh",
+    "set -eu",
+    "mkdir -p artifacts",
+    ": > artifacts/stdout.log",
+    ": > artifacts/stderr.log",
+    ": > artifacts/summary.txt",
+    "run_step() {",
+    "  step_name=\"$1\"",
+    "  step_command=\"$2\"",
+    "  printf '[sandbox-step] %s\\n' \"$step_name\"",
+    "  if sh -lc \"$step_command\" >> artifacts/stdout.log 2>> artifacts/stderr.log; then",
+    "    printf '%s:PASS\\n' \"$step_name\" >> artifacts/summary.txt",
+    "  else",
+    "    printf '%s:FAIL\\n' \"$step_name\" >> artifacts/summary.txt",
+    "    cat artifacts/summary.txt",
+    "    exit 1",
+    "  fi",
+    "}",
+  ];
+
+  if (manifest.length === 0) {
+    lines.push(
+      "printf 'sandbox-job-proof-ready' > artifacts/summary.txt",
+      "printf '%s\\n' '<testsuites name=\"Axiom Sandbox Proof\" tests=\"1\" failures=\"0\"><testsuite name=\"Podman Workspace\" tests=\"1\" failures=\"0\"><testcase name=\"workspace artifact round trip\"/></testsuite></testsuites>' > artifacts/junit.xml",
+    );
+  } else {
+    for (const step of manifest) {
+      lines.push(`run_step ${shellQuote(step.name)} ${shellQuote(step.command)}`);
+    }
+    lines.push(
+      "printf 'sandbox-command-manifest-ready\\n' >> artifacts/summary.txt",
+      "printf '%s\\n' '<testsuites name=\"Axiom Sandbox Manifest\" tests=\"1\" failures=\"0\"><testsuite name=\"Configured Commands\" tests=\"1\" failures=\"0\"><testcase name=\"configured command manifest passed\"/></testsuite></testsuites>' > artifacts/junit.xml",
+    );
+  }
+
+  lines.push(
+    "cat input.json",
+    "printf '\\n'",
+    "cat artifacts/summary.txt",
+  );
+
+  return lines.join("\n");
+}
+
 async function runLocalWorkflow(jobId: string) {
   const store = await readStore();
   const jobSnapshot = store.jobs.find((candidate) => candidate.id === jobId);
@@ -1560,6 +2624,18 @@ async function runLocalWorkflow(jobId: string) {
       `[${formatLogTime()}] [AGENT-QA] Test Coverage: ${result.finalPr.testCoverage}%`,
     ]);
   });
+
+  const sandboxProof = await runJobSandboxProof(jobSnapshot, result, 2, store.integrations || []);
+  if (sandboxProof) {
+    await updateJob(jobId, (job) => {
+      job.result = result;
+      appendJobLog(job, [
+        `[${formatLogTime()}] [SANDBOX] Podman job workspace proof executed in ${sandboxProof.image}.`,
+        `[${formatLogTime()}] [SANDBOX] Isolation: network=${sandboxProof.network}, memory=${sandboxProof.memory}, cpus=${sandboxProof.cpus}.`,
+        `[${formatLogTime()}] [SANDBOX] Artifact captured from mounted workspace: ${sandboxProof.artifact}.`,
+      ]);
+    });
+  }
 
   await wait(900);
   await updateJob(jobId, (job) => {
@@ -1791,6 +2867,65 @@ async function deliverInviteEmail(params: {
   }
 }
 
+async function evictHermesMemory(job: StoredJob, requestedByEmail: string) {
+  if (!hermesMemoryEvictionWebhookUrl) {
+    return {
+      ok: false as const,
+      statusCode: 409,
+      error: "Hermes memory eviction webhook is not configured.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), hermesMemoryEvictionWebhookTimeoutMs);
+
+  try {
+    const response = await fetch(hermesMemoryEvictionWebhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(process.env.HERMES_MEMORY_EVICTION_WEBHOOK_TOKEN
+          ? { Authorization: `Bearer ${process.env.HERMES_MEMORY_EVICTION_WEBHOOK_TOKEN}` }
+          : {}),
+      },
+      body: JSON.stringify({
+        jobId: job.id,
+        executionId: job.executionId,
+        hermesSessionId: job.hermesSessionId,
+        gitBranch: job.gitBranch,
+        targetRepository: job.targetRepository,
+        requestedByEmail,
+        requestedAt: nowIso(),
+      }),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    const body = text ? JSON.parse(text) as { evictionId?: string; message?: string } : {};
+
+    if (!response.ok) {
+      return {
+        ok: false as const,
+        statusCode: response.status >= 500 ? 502 : response.status,
+        error: body.message || "Hermes memory eviction failed.",
+      };
+    }
+
+    return {
+      ok: true as const,
+      evictionId: body.evictionId || null,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Hermes memory eviction failed.";
+    return {
+      ok: false as const,
+      statusCode: 502,
+      error: message,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Health check
 app.get("/api/health", (req, res) => {
   res.json({
@@ -1809,11 +2944,73 @@ app.get("/api/health", (req, res) => {
     execution: {
       jobDispatchEnabled: workflowExecutionAvailable(),
       reviewActionsEnabled: reviewActionsAvailable(),
+      rollbackActionsEnabled: rollbackActionsAvailable(),
       localWorkflowRunnerEnabled,
       localReviewActionsEnabled,
+      githubAppReviewActionsEnabled,
+      githubAppRollbackActionsEnabled,
+      hermesMemoryEvictionConfigured: Boolean(hermesMemoryEvictionWebhookUrl),
     },
   });
 });
+
+app.post(
+  "/api/sandbox/verify",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const result = await verifySandboxRuntime();
+      if (result.ok === false) {
+        return res.status(result.statusCode).json(result);
+      }
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/sandbox/execute-smoke",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    let workspaceDir = "";
+    try {
+      fs.mkdirSync(dataDir, { recursive: true });
+      workspaceDir = fs.mkdtempSync(path.join(dataDir, "sandbox-smoke-"));
+      fs.writeFileSync(path.join(workspaceDir, "input.txt"), "sandbox-input\n", "utf8");
+
+      const result = await executePodmanSandboxCommand({
+        workspaceDir,
+        command: "printf sandbox-exec-ready > artifact.txt && cat input.txt && cat artifact.txt",
+      });
+      if (result.ok === false) {
+        return res.status(result.statusCode).json(result);
+      }
+
+      const artifactPath = path.join(workspaceDir, "artifact.txt");
+      const artifactCreated = fs.existsSync(artifactPath);
+      const artifact = artifactCreated ? fs.readFileSync(artifactPath, "utf8").trim() : null;
+
+      res.json({
+        ...result,
+        workspaceMounted: true,
+        artifactCreated,
+        artifact,
+      });
+    } catch (error) {
+      next(error);
+    } finally {
+      if (workspaceDir) {
+        fs.rmSync(workspaceDir, { recursive: true, force: true });
+      }
+    }
+  },
+);
 
 app.get("/api/auth/session", async (req, res, next) => {
   try {
@@ -2836,6 +4033,263 @@ app.post(
   },
 );
 
+app.post(
+  "/api/integrations/github-app/branches/delete",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await deleteGitHubAppBranch(store.integrations || [], repository, req.body?.branchName);
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        defaultBranch: result.defaultBranch,
+        branchName: result.branchName,
+        ref: result.ref,
+        branchSha: result.branchSha,
+        branchObjectType: result.branchObjectType,
+        deleted: result.deleted,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/file-commits",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await commitGitHubAppFile(
+        store.integrations || [],
+        repository,
+        req.body?.branchName,
+        req.body?.filePath,
+        req.body?.content,
+        req.body?.commitMessage,
+      );
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.status(result.statusCode).json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        branchName: result.branchName,
+        branchSha: result.branchSha,
+        branchObjectType: result.branchObjectType,
+        path: result.path,
+        contentSha: result.contentSha,
+        contentUrl: result.contentUrl,
+        commitSha: result.commitSha,
+        commitUrl: result.commitUrl,
+        commitMessage: result.commitMessage,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/pull-requests",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const jobId = typeof req.body?.jobId === "string" ? req.body.jobId.trim() : "";
+      if (jobId) {
+        const job = store.jobs.find((candidate) => candidate.id === jobId);
+        if (!job) {
+          return res.status(404).json({ ok: false, error: "Job not found" });
+        }
+        if (job.gitBranch !== req.body?.branchName) {
+          return res.status(409).json({ ok: false, error: "Pull request branch does not match the job branch." });
+        }
+        if (job.targetRepository !== repository) {
+          return res.status(409).json({ ok: false, error: "Pull request repository does not match the job target repository." });
+        }
+      }
+
+      const result = await createGitHubAppPullRequest(
+        store.integrations || [],
+        repository,
+        req.body?.branchName,
+        req.body?.title,
+        req.body?.body,
+        req.body?.baseBranch,
+        req.body?.draft,
+      );
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      if (jobId) {
+        await updateJob(jobId, (job) => {
+          job.pullRequest = {
+            number: result.pullRequestNumber,
+            url: result.pullRequestUrl,
+            state: result.pullRequestState,
+            draft: result.draft,
+            title: result.title,
+            body: result.body,
+            headRef: result.headRef,
+            headSha: result.headSha,
+            baseRef: result.baseBranch,
+            baseSha: result.baseSha,
+            merged: false,
+          };
+          appendJobLog(job, [
+            `[${formatLogTime()}] [GITHUB] Pull request #${result.pullRequestNumber} opened for ${result.branchName}.`,
+            `[${formatLogTime()}] [GITHUB] ${result.pullRequestUrl}`,
+          ]);
+        });
+      }
+
+      res.status(201).json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        branchName: result.branchName,
+        branchSha: result.branchSha,
+        branchObjectType: result.branchObjectType,
+        baseBranch: result.baseBranch,
+        baseSha: result.baseSha,
+        defaultBranch: result.defaultBranch,
+        pullRequestNumber: result.pullRequestNumber,
+        pullRequestUrl: result.pullRequestUrl,
+        pullRequestState: result.pullRequestState,
+        draft: result.draft,
+        title: result.title,
+        body: result.body,
+        headRef: result.headRef,
+        headSha: result.headSha,
+        attachedJobId: jobId || null,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/pull-requests/status",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await readGitHubAppPullRequest(
+        store.integrations || [],
+        repository,
+        req.body?.pullRequestNumber,
+      );
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        pullRequestNumber: result.pullRequestNumber,
+        pullRequestUrl: result.pullRequestUrl,
+        pullRequestState: result.pullRequestState,
+        draft: result.draft,
+        merged: result.merged,
+        mergeable: result.mergeable,
+        mergeableState: result.mergeableState,
+        title: result.title,
+        body: result.body,
+        headRef: result.headRef,
+        headSha: result.headSha,
+        baseRef: result.baseRef,
+        baseSha: result.baseSha,
+        authorLogin: result.authorLogin,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+app.post(
+  "/api/integrations/github-app/pull-requests/merge",
+  requireAuth,
+  requireCsrf,
+  requireRole(["ADMINISTRATOR"]),
+  async (req, res, next) => {
+    try {
+      const repository = req.body?.repository || process.env.DEFAULT_TARGET_REPOSITORY || "";
+      const store = await readStore();
+      const result = await mergeGitHubAppPullRequest(
+        store.integrations || [],
+        repository,
+        req.body?.pullRequestNumber,
+        req.body?.mergeMethod,
+        req.body?.commitTitle,
+        req.body?.commitMessage,
+        req.body?.expectedHeadSha,
+      );
+      if (result.ok === false) {
+        return res.status(result.statusCode).json({
+          ok: false,
+          error: result.error,
+        });
+      }
+
+      res.json({
+        ok: true,
+        credentialStatus: result.credentialStatus,
+        repository: result.repository,
+        pullRequestNumber: result.pullRequestNumber,
+        merged: result.merged,
+        mergeSha: result.mergeSha,
+        mergeMessage: result.mergeMessage,
+        mergeMethod: result.mergeMethod,
+        tokenReceived: true,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
 app.delete(
   "/api/integrations/:integrationId",
   requireAuth,
@@ -2931,11 +4385,71 @@ app.post(
   async (req, res, next) => {
     try {
       const auth = (req as AuthedRequest).auth;
-      if (!reviewActionsAvailable()) {
-        return res.status(503).json({
-          code: "REVIEW_ADAPTER_NOT_CONFIGURED",
-          error: "Production approve-and-merge requires a live GitHub App adapter. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+      const store = await readStore();
+      const jobSnapshot = store.jobs.find((candidate) => candidate.id === req.params.jobId);
+      if (!jobSnapshot) {
+        return res.status(404).json({ error: "Job not found" });
+      }
+      if (jobSnapshot.status !== "REVIEW_READY") {
+        return res.status(409).json({ error: "Job is not ready for approval" });
+      }
+
+      if (!localReviewActionsEnabled) {
+        if (!githubAppReviewActionsEnabled) {
+          return res.status(503).json({
+            code: "REVIEW_ADAPTER_NOT_CONFIGURED",
+            error: "Production approve-and-merge requires a live GitHub App adapter. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+          });
+        }
+        if (!jobSnapshot.pullRequest?.number) {
+          return res.status(409).json({
+            code: "PULL_REQUEST_METADATA_REQUIRED",
+            error: "GitHub App approve-and-merge requires pull request metadata on the job.",
+          });
+        }
+
+        const mergeResult = await mergeGitHubAppPullRequest(
+          store.integrations || [],
+          jobSnapshot.targetRepository,
+          jobSnapshot.pullRequest.number,
+          req.body?.mergeMethod || "squash",
+          req.body?.commitTitle || `Merge ${jobSnapshot.taskName}`,
+          req.body?.commitMessage || `Approved by ${auth.user.email} through Axiom.`,
+          req.body?.expectedHeadSha === undefined ? jobSnapshot.pullRequest.headSha : req.body.expectedHeadSha,
+        );
+        if (mergeResult.ok === false) {
+          return res.status(mergeResult.statusCode).json({
+            ok: false,
+            code: "GITHUB_APP_MERGE_FAILED",
+            error: mergeResult.error,
+          });
+        }
+
+        const job = await updateJob(req.params.jobId, (candidate) => {
+          candidate.status = "COMPLETED";
+          candidate.currentPhase = "COMPLETED_MERGED";
+          candidate.phaseIndex = 7;
+          candidate.terminalStatus = "COMPLETED";
+          candidate.runningText = "Job Merged & Completed";
+          candidate.assignedTo = "Completed";
+          candidate.completedAt = nowIso();
+          candidate.pullRequest = {
+            ...candidate.pullRequest!,
+            state: "closed",
+            merged: true,
+            mergeSha: mergeResult.mergeSha,
+            mergedAt: candidate.completedAt,
+          };
+          appendJobLog(candidate, [
+            `[${formatLogTime()}] [MERGE] Manager approval received from ${auth.user.email}.`,
+            `[${formatLogTime()}] [GITHUB] Pull request #${mergeResult.pullRequestNumber} merged via GitHub App (${mergeResult.mergeMethod}).`,
+            `[${formatLogTime()}] [GITHUB] Merge SHA: ${mergeResult.mergeSha}.`,
+            `[${formatLogTime()}] [LEDGER] Actual cost recorded: $${(candidate.result?.finalPr.actualCost || 0).toFixed(5)} USD.`,
+            `[${formatLogTime()}] [SYSTEM] Session complete. Sandbox resources released.`,
+          ]);
         });
+
+        return res.json({ job: job ? jobToClient(job, auth.user.role) : null });
       }
 
       const job = await updateJob(req.params.jobId, (candidate) => {
@@ -2976,11 +4490,75 @@ app.post(
   async (req, res, next) => {
     try {
       const auth = (req as AuthedRequest).auth;
-      if (!reviewActionsAvailable()) {
-        return res.status(503).json({
-          code: "REVIEW_ADAPTER_NOT_CONFIGURED",
-          error: "Production rollback requires live GitHub App and Hermes memory adapters. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+      if (!localReviewActionsEnabled) {
+        if (!githubAppRollbackActionsEnabled) {
+          return res.status(503).json({
+            code: "ROLLBACK_ADAPTER_NOT_CONFIGURED",
+            error: "Production rollback requires live GitHub App and Hermes memory adapters. The local review action path is disabled; set ENABLE_LOCAL_REVIEW_ACTIONS=true only for controlled staging or demo runs.",
+          });
+        }
+        if (!hermesMemoryEvictionWebhookUrl) {
+          return res.status(503).json({
+            code: "ROLLBACK_ADAPTER_NOT_CONFIGURED",
+            error: "Production rollback requires HERMES_MEMORY_EVICTION_WEBHOOK_URL before deleting GitHub feature branches.",
+          });
+        }
+
+        const store = await readStore();
+        const jobSnapshot = store.jobs.find((candidate) => candidate.id === req.params.jobId);
+        if (!jobSnapshot) {
+          return res.status(404).json({ error: "Job not found" });
+        }
+        if (jobSnapshot.status !== "REVIEW_READY" && jobSnapshot.status !== "FAILED") {
+          return res.status(409).json({ error: "Job cannot be rolled back from its current state" });
+        }
+
+        const branchDelete = await deleteGitHubAppBranch(
+          store.integrations || [],
+          jobSnapshot.targetRepository,
+          jobSnapshot.gitBranch,
+        );
+        if (branchDelete.ok === false) {
+          return res.status(branchDelete.statusCode).json({
+            ok: false,
+            code: "GITHUB_APP_BRANCH_DELETE_FAILED",
+            error: branchDelete.error,
+          });
+        }
+
+        const memoryEviction = await evictHermesMemory(jobSnapshot, auth.user.email);
+        if (memoryEviction.ok === false) {
+          return res.status(memoryEviction.statusCode).json({
+            ok: false,
+            code: "HERMES_MEMORY_EVICTION_FAILED",
+            error: memoryEviction.error,
+          });
+        }
+
+        const job = await updateJob(req.params.jobId, (candidate) => {
+          candidate.status = "ROLLED_BACK";
+          candidate.currentPhase = "ROLLED_BACK";
+          candidate.phaseIndex = 7;
+          candidate.terminalStatus = "ROLLED_BACK";
+          candidate.runningText = "Deterministic Rollback Complete";
+          candidate.assignedTo = "Rollback Complete";
+          candidate.completedAt = nowIso();
+          candidate.rollbackSnapshot = {
+            branchDeleted: branchDelete.deleted,
+            jobStateReverted: true,
+            memoryEvicted: true,
+            completedAt: candidate.completedAt,
+          };
+          appendJobLog(candidate, [
+            `[${formatLogTime()}] [ROLLBACK] 1-click rollback requested by ${auth.user.email}.`,
+            `[${formatLogTime()}] [GITHUB] Feature branch ${branchDelete.branchName} deleted via GitHub App.`,
+            `[${formatLogTime()}] [HERMES] Agent memory context evicted for execution ${candidate.executionId}.`,
+            ...(memoryEviction.evictionId ? [`[${formatLogTime()}] [HERMES] Eviction ID: ${memoryEviction.evictionId}.`] : []),
+            `[${formatLogTime()}] [STORE] Job state transitioned to ROLLED_BACK atomically after external cleanup.`,
+          ]);
         });
+
+        return res.json({ job: job ? jobToClient(job, auth.user.role) : null });
       }
 
       const job = await updateJob(req.params.jobId, (candidate) => {
@@ -3070,10 +4648,15 @@ app.get("/api/settings", requireAuth, async (req, res, next) => {
         workflowProvider: workflowProviderStatus(),
         sandboxProvider: sandboxProviderStatus(),
         reviewActionProvider: reviewActionStatus(),
+        rollbackActionProvider: rollbackActionStatus(),
         jobDispatchEnabled: workflowExecutionAvailable(),
         reviewActionsEnabled: reviewActionsAvailable(),
+        rollbackActionsEnabled: rollbackActionsAvailable(),
         localWorkflowRunnerEnabled,
         localReviewActionsEnabled,
+        githubAppReviewActionsEnabled,
+        githubAppRollbackActionsEnabled,
+        hermesMemoryEvictionConfigured: Boolean(hermesMemoryEvictionWebhookUrl),
       },
     });
   } catch (error) {
